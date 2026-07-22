@@ -1,0 +1,1204 @@
+diff --git a/cmake/install.cmake b/cmake/install.cmake
+index 6aaed9bf6..4183a41a0 100644
+--- a/cmake/install.cmake
++++ b/cmake/install.cmake
+@@ -100,9 +100,9 @@ if (TFM_PARTITION_INTERNAL_TRUSTED_STORAGE)
+ endif()
+ 
+ if (TFM_PARTITION_CRYPTO)
++    # The PSA Crypto headers TF-M no longer ships come from the selected backend;
++    # the TF-M-specific driver headers stay.
+     install(FILES       ${INTERFACE_INC_DIR}/psa/README.rst
+-                        ${INTERFACE_INC_DIR}/psa/crypto.h
+-                        ${INTERFACE_INC_DIR}/psa/crypto_compat.h
+                         ${INTERFACE_INC_DIR}/psa/crypto_driver_common.h
+                         ${INTERFACE_INC_DIR}/psa/crypto_driver_contexts_composites.h
+                         ${INTERFACE_INC_DIR}/psa/crypto_driver_contexts_key_derivation.h
+@@ -110,17 +110,18 @@ if (TFM_PARTITION_CRYPTO)
+                         ${INTERFACE_INC_DIR}/psa/crypto_driver_random.h
+                         ${INTERFACE_INC_DIR}/psa/crypto_extra.h
+                         ${INTERFACE_INC_DIR}/psa/crypto_platform.h
+-                        ${INTERFACE_INC_DIR}/psa/crypto_sizes.h
+-                        ${INTERFACE_INC_DIR}/psa/crypto_struct.h
+-                        ${INTERFACE_INC_DIR}/psa/crypto_types.h
+-                        ${INTERFACE_INC_DIR}/psa/crypto_values.h
++            DESTINATION ${INSTALL_INTERFACE_INC_DIR}/psa)
++    install(FILES       ${WOLFPSA_PATH}/wolfpsa/psa/crypto.h
++                        ${WOLFPSA_PATH}/wolfpsa/psa/crypto-pqc.h
++                        ${WOLFPSA_PATH}/wolfpsa/psa/crypto_compat.h
++                        ${WOLFPSA_PATH}/wolfpsa/psa/crypto_config.h
++                        ${WOLFPSA_PATH}/wolfpsa/psa/crypto_sizes.h
++                        ${WOLFPSA_PATH}/wolfpsa/psa/crypto_struct.h
++                        ${WOLFPSA_PATH}/wolfpsa/psa/crypto_types.h
++                        ${WOLFPSA_PATH}/wolfpsa/psa/crypto_values.h
+             DESTINATION ${INSTALL_INTERFACE_INC_DIR}/psa)
+     install(FILES       ${INTERFACE_INC_DIR}/tfm_crypto_defs.h
+             DESTINATION ${INSTALL_INTERFACE_INC_DIR})
+-    install(DIRECTORY   ${INTERFACE_INC_DIR}/mbedtls
+-            DESTINATION ${INSTALL_INTERFACE_INC_DIR})
+-    install(DIRECTORY   ${INTERFACE_INC_DIR}/tf-psa-crypto
+-            DESTINATION ${INSTALL_INTERFACE_INC_DIR})
+ endif()
+ 
+ if (TFM_PARTITION_INITIAL_ATTESTATION)
+diff --git a/config/config_base.h b/config/config_base.h
+index d5cf0dfe2..cac4a07e0 100644
+--- a/config/config_base.h
++++ b/config/config_base.h
+@@ -123,7 +123,9 @@
+ 
+ /* The stack size of the Crypto Secure Partition */
+ #ifndef CRYPTO_STACK_SIZE
+-#define CRYPTO_STACK_SIZE                      0x1800
++/* wolfCrypt SP-math ECC runs on-stack (WOLFSSL_SP_NO_MALLOC), so ECDH/ECDSA
++ * need more than the 0x1800 that tf-psa-crypto fits in. */
++#define CRYPTO_STACK_SIZE                      0x4000
+ #endif
+ 
+ /* FWU Partition Configs */
+diff --git a/interface/CMakeLists.txt b/interface/CMakeLists.txt
+index c4a56b540..8c613446f 100644
+--- a/interface/CMakeLists.txt
++++ b/interface/CMakeLists.txt
+@@ -21,9 +21,14 @@ add_library(psa_interface INTERFACE)
+ 
+ target_include_directories(psa_interface
+     INTERFACE
++        # Thin redirects make wolfPSA supply the PSA Crypto headers while TF-M's
++        # psa/error.h, initial_attestation.h, client.h and service.h still win.
++        $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/../lib/ext/wolfpsa/psa_shim>
+         $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
+         $<BUILD_INTERFACE:${CMAKE_BINARY_DIR}/generated/interface/include>
+         $<BUILD_INTERFACE:$<$<BOOL:${TFM_MULTI_CORE_TOPOLOGY}>:${CMAKE_CURRENT_SOURCE_DIR}/include/multi_core>>
++        # Resolves the wolfpsa/psa/* targets of the redirect shim above.
++        $<BUILD_INTERFACE:${WOLFPSA_PATH}>
+ )
+ 
+ target_link_libraries(psa_interface
+@@ -33,6 +38,9 @@ target_link_libraries(psa_interface
+ 
+ target_compile_definitions(psa_interface
+     INTERFACE
++        # Both the client stub and the crypto service include wolfPSA's operation
++        # structs, so both must see the IPC handle field or the ABI would split.
++        WOLFPSA_CRYPTO_CLIENT_SERVER
+         $<$<BOOL:${CONFIG_TFM_ENABLE_CTX_MGMT}>:CONFIG_TFM_ENABLE_CTX_MGMT>
+         $<$<BOOL:${TFM_ISOLATION_LEVEL}>:TFM_ISOLATION_LEVEL=${TFM_ISOLATION_LEVEL}>
+         $<$<BOOL:${CONFIG_TFM_USE_TRUSTZONE}>:CONFIG_TFM_USE_TRUSTZONE>
+diff --git a/lib/ext/CMakeLists.txt b/lib/ext/CMakeLists.txt
+index 06e952ac9..a95a7fc94 100644
+--- a/lib/ext/CMakeLists.txt
++++ b/lib/ext/CMakeLists.txt
+@@ -8,6 +8,7 @@ set(FETCHCONTENT_BASE_DIR ${CMAKE_BINARY_DIR}/lib/ext CACHE STRING "" FORCE)
+ 
+ add_subdirectory(qcbor)
+ add_subdirectory(tf-psa-crypto)
++add_subdirectory(wolfpsa)
+ add_subdirectory(t_cose)
+ add_subdirectory(cmsis)
+ add_subdirectory(efi_soft_crc)
+diff --git a/lib/ext/wolfpsa/CMakeLists.txt b/lib/ext/wolfpsa/CMakeLists.txt
+new file mode 100644
+index 000000000..3ca39c0c2
+--- /dev/null
++++ b/lib/ext/wolfpsa/CMakeLists.txt
+@@ -0,0 +1,132 @@
++if (NOT TFM_PARTITION_CRYPTO)
++    return()
++endif()
++
++cmake_minimum_required(VERSION 3.21)
++
++if (NOT WOLFPSA_PATH OR NOT EXISTS ${WOLFPSA_PATH})
++    message(FATAL_ERROR "WOLFPSA_PATH = '${WOLFPSA_PATH}' is not set or does not exist. "
++                        "Provide a wolfPSA checkout with -DWOLFPSA_PATH=")
++endif()
++if (NOT WOLFSSL_PATH OR NOT EXISTS ${WOLFSSL_PATH})
++    message(FATAL_ERROR "WOLFSSL_PATH = '${WOLFSSL_PATH}' is not set or does not exist. "
++                        "wolfPSA needs wolfCrypt. Use -DWOLFSSL_PATH=")
++endif()
++
++file(GLOB WOLFPSA_SOURCES ${WOLFPSA_PATH}/src/*.c)
++list(REMOVE_ITEM WOLFPSA_SOURCES ${WOLFPSA_PATH}/src/psa_store_posix.c)
++
++add_library(crypto_service_wolfpsa STATIC EXCLUDE_FROM_ALL)
++
++target_sources(crypto_service_wolfpsa
++    PRIVATE
++        ${WOLFPSA_SOURCES}
++        # ITS-backed persistence replaces the POSIX file store.
++        ${CMAKE_CURRENT_LIST_DIR}/psa_store_tfm.c
++        ${CMAKE_CURRENT_LIST_DIR}/wolfpsa_heap.c
++        ${WOLFSSL_PATH}/wolfcrypt/src/wc_port.c
++        ${WOLFSSL_PATH}/wolfcrypt/src/memory.c
++        ${WOLFSSL_PATH}/wolfcrypt/src/misc.c
++        ${WOLFSSL_PATH}/wolfcrypt/src/logging.c
++        ${WOLFSSL_PATH}/wolfcrypt/src/error.c
++        ${WOLFSSL_PATH}/wolfcrypt/src/wolfmath.c
++        ${WOLFSSL_PATH}/wolfcrypt/src/sp_int.c
++        ${WOLFSSL_PATH}/wolfcrypt/src/sp_c32.c
++        ${WOLFSSL_PATH}/wolfcrypt/src/random.c
++        ${WOLFSSL_PATH}/wolfcrypt/src/hash.c
++        ${WOLFSSL_PATH}/wolfcrypt/src/sha.c
++        ${WOLFSSL_PATH}/wolfcrypt/src/sha256.c
++        ${WOLFSSL_PATH}/wolfcrypt/src/sha512.c
++        ${WOLFSSL_PATH}/wolfcrypt/src/sha3.c
++        ${WOLFSSL_PATH}/wolfcrypt/src/hmac.c
++        ${WOLFSSL_PATH}/wolfcrypt/src/kdf.c
++        ${WOLFSSL_PATH}/wolfcrypt/src/cmac.c
++        ${WOLFSSL_PATH}/wolfcrypt/src/aes.c
++        ${WOLFSSL_PATH}/wolfcrypt/src/ecc.c
++        ${WOLFSSL_PATH}/wolfcrypt/src/rsa.c
++        ${WOLFSSL_PATH}/wolfcrypt/src/asn.c
++        ${WOLFSSL_PATH}/wolfcrypt/src/coding.c
++        ${WOLFSSL_PATH}/wolfcrypt/src/signature.c
++        ${WOLFSSL_PATH}/wolfcrypt/src/wc_encrypt.c
++        ${WOLFSSL_PATH}/wolfcrypt/src/chacha.c
++        ${WOLFSSL_PATH}/wolfcrypt/src/poly1305.c
++        ${WOLFSSL_PATH}/wolfcrypt/src/chacha20_poly1305.c
++        ${WOLFSSL_PATH}/wolfcrypt/src/curve25519.c
++        ${WOLFSSL_PATH}/wolfcrypt/src/ed25519.c
++        ${WOLFSSL_PATH}/wolfcrypt/src/fe_operations.c
++        ${WOLFSSL_PATH}/wolfcrypt/src/ge_operations.c
++        ${WOLFSSL_PATH}/wolfcrypt/src/des3.c
++        ${WOLFSSL_PATH}/wolfcrypt/src/md5.c
++        ${WOLFSSL_PATH}/wolfcrypt/src/ripemd.c
++        ${WOLFSSL_PATH}/wolfcrypt/src/ed448.c
++        ${WOLFSSL_PATH}/wolfcrypt/src/fe_448.c
++        ${WOLFSSL_PATH}/wolfcrypt/src/ge_448.c
++        ${WOLFSSL_PATH}/wolfcrypt/src/pwdbased.c
++        ${WOLFSSL_PATH}/wolfcrypt/src/wolfentropy.c
++)
++
++target_include_directories(crypto_service_wolfpsa
++    PUBLIC
++        ${WOLFPSA_PATH}
++        ${WOLFPSA_PATH}/wolfpsa
++        ${CMAKE_CURRENT_LIST_DIR}
++        ${WOLFSSL_PATH}
++        ${CMAKE_CURRENT_SOURCE_DIR}/../../../secure_fw/partitions/crypto
++        # tfm_builtin_key_loader.h only needs psa/crypto.h; the driver .c
++        # itself is mbedtls coupled and is not compiled.
++        ${CMAKE_CURRENT_SOURCE_DIR}/../../../secure_fw/partitions/crypto/psa_driver_api
++        # platform_crypto_keys reaches tfm_plat_crypto_keys.h through whichever
++        # crypto library target it links, so this target has to carry it too.
++        ${CMAKE_CURRENT_SOURCE_DIR}/../../../platform/include
++        $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/../../../interface/include>
++    PRIVATE
++        ${WOLFPSA_PATH}/src
++)
++
++target_compile_definitions(crypto_service_wolfpsa
++    PUBLIC
++        WOLFSSL_USER_SETTINGS
++        WOLFPSA_KEY_ID_ENCODES_OWNER
++        # wolfpsa_trace() uses getenv/stdio, which a secure partition cannot link.
++        WOLFPSA_NO_TRACE
++        # TF-M runs crypto as a client/server PSA service, so the operation
++        # structs carry the IPC handle.
++        WOLFPSA_CRYPTO_CLIENT_SERVER
++        # Marks this as the server build: op structs keep their full context,
++        # while the client (interface) sees only the uint32_t IPC handle.
++        WOLFPSA_CRYPTO_SERVER
++        TFM_CRYPTO_BACKEND_WOLFPSA
++        # Selects the in-tree slot enum in tfm_builtin_key_loader.h; without it
++        # the header wants a per platform ids file that an521 does not ship.
++        $<$<BOOL:${PLATFORM_DEFAULT_CRYPTO_KEYS}>:PLATFORM_DEFAULT_CRYPTO_KEYS>
++        $<$<BOOL:${PLATFORM_DEFAULT_NV_SEED}>:PLATFORM_DEFAULT_NV_SEED>
++        # Fail closed by default: user_settings.h #errors on a crypto-server build
++        # with no entropy source. Emulators (QEMU, no TRNG) must EXPLICITLY pass
++        # -DWOLFPSA_TFM_ALLOW_TEST_ENTROPY=ON for a deterministic bring-up seed;
++        # production wires CUSTOM_RAND_GENERATE_SEED to a real TRNG instead.
++        $<$<BOOL:${WOLFPSA_TFM_ALLOW_TEST_ENTROPY}>:WOLFPSA_TFM_ALLOW_TEST_ENTROPY>
++)
++
++target_compile_options(crypto_service_wolfpsa
++    PRIVATE
++        ${COMPILER_CP_FLAG}
++        -Wno-unused-parameter
++        -Wno-unused-const-variable
++        # SHELL: keeps each -include as its own unit (CMake would otherwise
++        # deduplicate the repeated -include token and merge the paths).
++        # 1) our settings ahead of wolfPSA's own user_settings.h (bare-metal opts).
++        "SHELL:-include ${CMAKE_CURRENT_LIST_DIR}/user_settings.h"
++        # 2) crypto_spe.h renames wolfPSA's PSA symbols to tfpsacrypto__* (the same
++        #    shim the crypto service uses), so the service binds to wolfPSA rather
++        #    than recursing into the client IPC stub.
++        "SHELL:-include ${CMAKE_CURRENT_LIST_DIR}/../../../secure_fw/partitions/crypto/crypto_spe.h"
++)
++
++target_link_libraries(crypto_service_wolfpsa
++    PRIVATE
++        platform_s
++    PUBLIC
++        tfm_config
++)
++
++set_target_properties(crypto_service_wolfpsa PROPERTIES LINK_INTERFACE_MULTIPLICITY 3)
+diff --git a/lib/ext/wolfpsa/psa_shim/psa/crypto.h b/lib/ext/wolfpsa/psa_shim/psa/crypto.h
+new file mode 100644
+index 000000000..48b49576f
+--- /dev/null
++++ b/lib/ext/wolfpsa/psa_shim/psa/crypto.h
+@@ -0,0 +1 @@
++#include "wolfpsa/psa/crypto.h"
+diff --git a/lib/ext/wolfpsa/psa_shim/psa/crypto_compat.h b/lib/ext/wolfpsa/psa_shim/psa/crypto_compat.h
+new file mode 100644
+index 000000000..25ed12642
+--- /dev/null
++++ b/lib/ext/wolfpsa/psa_shim/psa/crypto_compat.h
+@@ -0,0 +1 @@
++#include "wolfpsa/psa/crypto_compat.h"
+diff --git a/lib/ext/wolfpsa/psa_shim/psa/crypto_sizes.h b/lib/ext/wolfpsa/psa_shim/psa/crypto_sizes.h
+new file mode 100644
+index 000000000..3afe50e65
+--- /dev/null
++++ b/lib/ext/wolfpsa/psa_shim/psa/crypto_sizes.h
+@@ -0,0 +1 @@
++#include "wolfpsa/psa/crypto_sizes.h"
+diff --git a/lib/ext/wolfpsa/psa_shim/psa/crypto_struct.h b/lib/ext/wolfpsa/psa_shim/psa/crypto_struct.h
+new file mode 100644
+index 000000000..ed997c298
+--- /dev/null
++++ b/lib/ext/wolfpsa/psa_shim/psa/crypto_struct.h
+@@ -0,0 +1 @@
++#include "wolfpsa/psa/crypto_struct.h"
+diff --git a/lib/ext/wolfpsa/psa_shim/psa/crypto_types.h b/lib/ext/wolfpsa/psa_shim/psa/crypto_types.h
+new file mode 100644
+index 000000000..f0e390a17
+--- /dev/null
++++ b/lib/ext/wolfpsa/psa_shim/psa/crypto_types.h
+@@ -0,0 +1 @@
++#include "wolfpsa/psa/crypto_types.h"
+diff --git a/lib/ext/wolfpsa/psa_shim/psa/crypto_values.h b/lib/ext/wolfpsa/psa_shim/psa/crypto_values.h
+new file mode 100644
+index 000000000..8b82ea825
+--- /dev/null
++++ b/lib/ext/wolfpsa/psa_shim/psa/crypto_values.h
+@@ -0,0 +1 @@
++#include "wolfpsa/psa/crypto_values.h"
+diff --git a/lib/ext/wolfpsa/psa_store_tfm.c b/lib/ext/wolfpsa/psa_store_tfm.c
+new file mode 100644
+index 000000000..ad380cb20
+--- /dev/null
++++ b/lib/ext/wolfpsa/psa_store_tfm.c
+@@ -0,0 +1,147 @@
++#include <stddef.h>
++#include <stdint.h>
++#include <string.h>
++
++#include "psa_store.h"
++#include "psa/internal_trusted_storage.h"
++#include "psa/storage_common.h"
++
++/* wolfPSA's store is a stream (Open/Read/Write/Close) but ITS is whole object,
++ * so a slot buffers the object between Open and Close. One request is in flight
++ * per partition, hence a single static slot and no heap. */
++#ifndef WOLFPSA_STORE_MAX_OBJ
++#define WOLFPSA_STORE_MAX_OBJ 512
++#endif
++
++typedef struct {
++    psa_storage_uid_t uid;
++    uint8_t  buf[WOLFPSA_STORE_MAX_OBJ];
++    size_t   len;
++    size_t   pos;
++    int      in_use;
++    int      read;
++} wolfpsa_tfm_slot;
++
++static wolfpsa_tfm_slot g_slot;
++
++/* id1 is the key id, id2 the owner: both halves must select the object or two
++ * clients using the same key id would collide. */
++static psa_storage_uid_t wolfpsa_tfm_uid(int type, unsigned long id1,
++                                          unsigned long id2)
++{
++    return (((psa_storage_uid_t)(uint32_t)id2) << 32)
++           | ((psa_storage_uid_t)(uint32_t)id1)
++           | (((psa_storage_uid_t)(uint8_t)type) << 56);
++}
++
++int wolfPSA_Store_OpenSz(int type, unsigned long id1, unsigned long id2,
++                          int read, int variableSz, void** store)
++{
++    psa_storage_uid_t uid = wolfpsa_tfm_uid(type, id1, id2);
++    size_t got = 0;
++
++    (void)variableSz;
++
++    if (store == NULL) {
++        return -1;
++    }
++    if (g_slot.in_use != 0) {
++        return -1;
++    }
++
++    g_slot.uid = uid;
++    g_slot.pos = 0;
++    g_slot.len = 0;
++    g_slot.read = read;
++
++    if (read != 0) {
++        if (psa_its_get(uid, 0, sizeof(g_slot.buf), g_slot.buf, &got)
++            != PSA_SUCCESS) {
++            /* -4 is what the POSIX store returns for "no such object". */
++            return -4;
++        }
++        g_slot.len = got;
++    }
++
++    g_slot.in_use = 1;
++    *store = &g_slot;
++    return 0;
++}
++
++int wolfPSA_Store_Open(int type, unsigned long id1, unsigned long id2,
++                        int read, void** store)
++{
++    return wolfPSA_Store_OpenSz(type, id1, id2, read, 0, store);
++}
++
++int wolfPSA_Store_Read(void* store, unsigned char* buffer, int len)
++{
++    wolfpsa_tfm_slot* s = (wolfpsa_tfm_slot*)store;
++    size_t n;
++
++    if ((s == NULL) || (buffer == NULL) || (len < 0)) {
++        return -1;
++    }
++
++    n = s->len - s->pos;
++    if (n > (size_t)len) {
++        n = (size_t)len;
++    }
++    (void)memcpy(buffer, &s->buf[s->pos], n);
++    s->pos += n;
++    return (int)n;
++}
++
++int wolfPSA_Store_Write(void* store, unsigned char* buffer, int len)
++{
++    wolfpsa_tfm_slot* s = (wolfpsa_tfm_slot*)store;
++
++    if ((s == NULL) || (buffer == NULL) || (len < 0)) {
++        return -1;
++    }
++    if ((s->pos + (size_t)len) > sizeof(s->buf)) {
++        return -1;
++    }
++
++    (void)memcpy(&s->buf[s->pos], buffer, (size_t)len);
++    s->pos += (size_t)len;
++    if (s->pos > s->len) {
++        s->len = s->pos;
++    }
++    return len;
++}
++
++/* The ITS write happens here: wolfPSA streams the object out, and only a closed
++ * object is complete. */
++void wolfPSA_Store_Close(void* store)
++{
++    wolfpsa_tfm_slot* s = (wolfpsa_tfm_slot*)store;
++
++    if (s == NULL) {
++        return;
++    }
++
++    if ((s->read == 0) && (s->len > 0u)) {
++        (void)psa_its_set(s->uid, s->len, s->buf, PSA_STORAGE_FLAG_NONE);
++    }
++
++    (void)memset(s->buf, 0, sizeof(s->buf));
++    s->in_use = 0;
++    s->len = 0;
++    s->pos = 0;
++}
++
++int wolfPSA_Store_Remove(int type, unsigned long id1, unsigned long id2)
++{
++    psa_storage_uid_t uid = wolfpsa_tfm_uid(type, id1, id2);
++    psa_status_t status = psa_its_remove(uid);
++
++    /* -4 is "no such object"; the key store maps it to INVALID_HANDLE. */
++    if (status == PSA_ERROR_DOES_NOT_EXIST) {
++        return -4;
++    }
++    if (status != PSA_SUCCESS) {
++        return -1;
++    }
++    return 0;
++}
+diff --git a/lib/ext/wolfpsa/user_settings.h b/lib/ext/wolfpsa/user_settings.h
+new file mode 100644
+index 000000000..ba5a4015f
+--- /dev/null
++++ b/lib/ext/wolfpsa/user_settings.h
+@@ -0,0 +1,93 @@
++#ifndef __WOLFPSA_TFM_USER_SETTINGS_H__
++#define __WOLFPSA_TFM_USER_SETTINGS_H__
++
++#ifdef __cplusplus
++extern "C" {
++#endif
++
++/* wolfSSL builds gnu11 where anonymous inline aggregates are on; TF-M's
++ * toolchain forces -std=c99, which turns them off and silently shrinks WC_RNG. */
++#define HAVE_ANONYMOUS_INLINE_AGGREGATES 1
++
++#define WOLFCRYPT_ONLY
++#define SINGLE_THREADED
++#define WOLFSSL_PSA_ENGINE
++#define NO_FILESYSTEM
++#define NO_WRITEV
++#define WOLFSSL_NO_SOCK
++#define NO_ERROR_STRINGS
++#define NO_WOLFSSL_DIR
++#define WC_NO_HARDEN
++
++/* The crypto partition has no heap. */
++
++/* SP math: no x86 asm, no TomsFastMath, on Cortex-M33. SP_SMALL keeps ECC off
++ * the (shared SFN) stack budget - the unrolled SP path overflows it. */
++#define WOLFSSL_SP_MATH_ALL
++#define WOLFSSL_HAVE_SP_ECC
++#define WOLFSSL_SP_384
++#define HAVE_SP_ECC
++#define WOLFSSL_SP_NO_MALLOC
++#define WOLFSSL_SP_SMALL
++
++#define WOLFSSL_SHA224
++#define WOLFSSL_SHA256
++#define WOLFSSL_SHA384
++#define WOLFSSL_SHA512
++#define NO_MD4
++#define NO_DSA
++#define NO_RC4
++/* TF-M's crypto profile treats SHA-1 as unsupported; keep wolfCrypt in step. */
++#define NO_SHA
++/* wolfPSA's full PSA surface references these when live-linked. */
++#define WOLFSSL_MD5
++#define WOLFSSL_RIPEMD
++#define HAVE_PBKDF2
++#define NO_PKCS12
++
++/* Entropy: only the crypto server runs wolfCrypt's RNG. The partition has no
++ * TRNG wired, and the default OS seed path pulls getenv/stdio. Production MUST
++ * provide CUSTOM_RAND_GENERATE_SEED backed by platform entropy; bring-up on QEMU
++ * (no TRNG) opts in to a deterministic seed with WOLFPSA_TFM_ALLOW_TEST_ENTROPY.
++ * Header-only includers (wolfCOSE/attestation ABI sharing) don't run the RNG. */
++#if defined(CUSTOM_RAND_GENERATE_SEED)
++    /* Platform supplies a real entropy hook. */
++#elif defined(WOLFPSA_TFM_ALLOW_TEST_ENTROPY)
++    #define WOLFSSL_GENSEED_FORTEST
++#elif defined(WOLFPSA_CRYPTO_SERVER)
++    #error "wolfPSA/TF-M entropy: the crypto server needs CUSTOM_RAND_GENERATE_SEED (production) or WOLFPSA_TFM_ALLOW_TEST_ENTROPY (bring-up only)"
++#endif
++
++#define HAVE_ECC
++#define HAVE_ECC384
++#define HAVE_ECC_KEY_EXPORT
++#define HAVE_ECC_KEY_IMPORT
++#define ECC_TIMING_RESISTANT
++#define HAVE_HKDF
++#define WOLFSSL_CMAC
++#define WOLFSSL_AES_DIRECT
++#define HAVE_AESGCM
++#define HAVE_AESCCM
++#define WOLFSSL_AES_COUNTER
++#define WOLFSSL_AES_CFB
++#define WOLFSSL_AES_OFB
++#define WOLFSSL_KEY_GEN
++
++/* RSA for RSASSA-PSS verify and RSA-OAEP: SP math, 2048-bit. */
++#define WC_RSA_PSS
++#define WOLFSSL_HAVE_SP_RSA
++#define WOLFSSL_SP_2048
++/* wolfPSA's cipher/sign surface references DES3 and Ed448 when live-linked. */
++#define WOLFSSL_DES_ECB
++#define HAVE_ED448
++#define WOLFSSL_ED448
++#define HAVE_ED448_KEY_IMPORT
++#define WOLFSSL_SHAKE256
++#define WOLFSSL_SHA3
++
++
++#ifdef __cplusplus
++}
++#endif
++
++#endif /* __WOLFPSA_TFM_USER_SETTINGS_H__ */
+diff --git a/lib/ext/wolfpsa/wolfpsa_heap.c b/lib/ext/wolfpsa/wolfpsa_heap.c
+new file mode 100644
+index 000000000..18e7e97c3
+--- /dev/null
++++ b/lib/ext/wolfpsa/wolfpsa_heap.c
+@@ -0,0 +1,139 @@
++#include <stddef.h>
++#include <stdint.h>
++
++/* wolfPSA's key store allocates key nodes from a heap the crypto partition does
++ * not otherwise have; this static pool stands in for it (the analogue of the
++ * mbedtls memory_buffer_alloc pool tfpsacrypto uses). A uint64_t backing array
++ * forces 8-byte alignment so wolfCrypt's block stores stay aligned. */
++#ifndef WOLFPSA_HEAP_SIZE
++#define WOLFPSA_HEAP_SIZE (128u * 1024u)
++#endif
++
++typedef struct wolfpsa_block {
++    struct wolfpsa_block* next;
++    size_t size;
++    int    free;
++} wolfpsa_block;
++
++#define WOLFPSA_HDR_SZ (((sizeof(wolfpsa_block)) + 7u) & ~((size_t)7u))
++
++static uint64_t       g_pool[WOLFPSA_HEAP_SIZE / sizeof(uint64_t)];
++static wolfpsa_block* g_head;
++
++static size_t wolfpsa_align8(size_t n)
++{
++    return (n + 7u) & ~((size_t)7u);
++}
++
++static void wolfpsa_heap_init(void)
++{
++    g_head = (wolfpsa_block*)(void*)g_pool;
++    g_head->next = NULL;
++    g_head->size = sizeof(g_pool) - WOLFPSA_HDR_SZ;
++    g_head->free = 1;
++}
++
++void *malloc(size_t size)
++{
++    wolfpsa_block* b;
++    wolfpsa_block* nb;
++    size_t need;
++
++    if (g_head == NULL) {
++        wolfpsa_heap_init();
++    }
++    if (size == 0u) {
++        return NULL;
++    }
++
++    need = wolfpsa_align8(size);
++    for (b = g_head; b != NULL; b = b->next) {
++        if ((b->free == 0) || (b->size < need)) {
++            continue;
++        }
++        /* Split only when the remainder can hold a header plus a payload. */
++        if (b->size >= (need + WOLFPSA_HDR_SZ + 8u)) {
++            nb = (wolfpsa_block*)(void*)((uint8_t*)b + WOLFPSA_HDR_SZ + need);
++            nb->next = b->next;
++            nb->size = b->size - need - WOLFPSA_HDR_SZ;
++            nb->free = 1;
++            b->next = nb;
++            b->size = need;
++        }
++        b->free = 0;
++        return (uint8_t*)b + WOLFPSA_HDR_SZ;
++    }
++    return NULL;
++}
++
++void free(void *ptr)
++{
++    wolfpsa_block* b;
++    wolfpsa_block* c;
++
++    if (ptr == NULL) {
++        return;
++    }
++
++    b = (wolfpsa_block*)(void*)((uint8_t*)ptr - WOLFPSA_HDR_SZ);
++    b->free = 1;
++
++    /* The list is address ordered and the pool stays contiguous, so a forward
++     * pass merges every run of adjacent free blocks. */
++    for (c = g_head; c != NULL; c = c->next) {
++        while ((c->free != 0) && (c->next != NULL) && (c->next->free != 0)) {
++            c->size += WOLFPSA_HDR_SZ + c->next->size;
++            c->next = c->next->next;
++        }
++    }
++}
++
++void *realloc(void *ptr, size_t size)
++{
++    wolfpsa_block* b;
++    void* n;
++    size_t old;
++    size_t i;
++
++    if (ptr == NULL) {
++        return malloc(size);
++    }
++    if (size == 0u) {
++        free(ptr);
++        return NULL;
++    }
++
++    b = (wolfpsa_block*)(void*)((uint8_t*)ptr - WOLFPSA_HDR_SZ);
++    old = b->size;
++    if (old >= wolfpsa_align8(size)) {
++        return ptr;
++    }
++
++    n = malloc(size);
++    if (n != NULL) {
++        for (i = 0u; i < old; i++) {
++            ((uint8_t*)n)[i] = ((uint8_t*)ptr)[i];
++        }
++        free(ptr);
++    }
++    return n;
++}
++
++void *calloc(size_t nmemb, size_t size)
++{
++    size_t total;
++    void* p;
++    size_t i;
++
++    if ((nmemb != 0u) && ((SIZE_MAX / nmemb) < size)) {
++        return NULL;
++    }
++    total = nmemb * size;
++    p = malloc(total);
++    if (p != NULL) {
++        for (i = 0u; i < total; i++) {
++            ((uint8_t*)p)[i] = 0u;
++        }
++    }
++    return p;
++}
+diff --git a/platform/CMakeLists.txt b/platform/CMakeLists.txt
+index 3849d8ef0..b9457ab9c 100644
+--- a/platform/CMakeLists.txt
++++ b/platform/CMakeLists.txt
+@@ -111,7 +111,7 @@ target_link_libraries(platform_s
+         tfm_config
+         $<$<BOOL:${TFM_PARTITION_CRYPTO}>:platform_crypto_keys>
+         $<$<BOOL:${PLATFORM_DEFAULT_ATTEST_HAL}>:tfm_sprt>
+-        $<$<BOOL:${TFM_PARTITION_CRYPTO}>:crypto_service_tfpsacrypto>
++        $<$<BOOL:${TFM_PARTITION_CRYPTO}>:crypto_service_wolfpsa>
+         $<$<BOOL:${TFM_PARTITION_INITIAL_ATTESTATION}>:tfm_attestation_defs>
+         tfm_fih
+         tfm_log
+@@ -166,7 +166,7 @@ if(TFM_PARTITION_CRYPTO)
+ 
+     target_link_libraries(platform_crypto_keys
+         PRIVATE
+-            crypto_service_tfpsacrypto
++            crypto_service_wolfpsa
+             tfm_psa_rot_partition_crypto
+             platform_region_defs
+             tfm_config
+diff --git a/secure_fw/partitions/crypto/CMakeLists.txt b/secure_fw/partitions/crypto/CMakeLists.txt
+index 962f71fe3..ffa011901 100644
+--- a/secure_fw/partitions/crypto/CMakeLists.txt
++++ b/secure_fw/partitions/crypto/CMakeLists.txt
+@@ -67,8 +67,7 @@ target_sources(tfm_psa_rot_partition_crypto
+         crypto_key_derivation.c
+         crypto_key_management.c
+         crypto_rng.c
+-        crypto_library.c
+-        $<$<BOOL:${CRYPTO_TFM_BUILTIN_KEYS_DRIVER}>:psa_driver_api/tfm_builtin_key_loader.c>
++        crypto_library_wolfpsa.c
+ )
+ 
+ # The generated sources
+@@ -85,6 +84,8 @@ target_sources(tfm_partitions
+ # Set include directory
+ target_include_directories(tfm_psa_rot_partition_crypto
+     PRIVATE
++        # The crypto server is wolfPSA, so its PSA headers win over TF-M's.
++        $<BUILD_INTERFACE:${WOLFPSA_PATH}/wolfpsa>
+         $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}>
+         ${CMAKE_BINARY_DIR}/generated/secure_fw/partitions/crypto
+         $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/../../../interface/include>
+@@ -99,11 +100,16 @@ target_include_directories(tfm_partitions
+ target_link_libraries(tfm_psa_rot_partition_crypto
+     PRIVATE
+         platform_s
+-        crypto_service_tfpsacrypto
++        crypto_service_wolfpsa
+         tfm_config
+         tfm_log_headers
+ )
+ 
++target_compile_definitions(tfm_psa_rot_partition_crypto
++    PRIVATE
++        TFM_CRYPTO_BACKEND_WOLFPSA
++)
++
+ target_compile_definitions(tfm_psa_rot_partition_crypto
+     PRIVATE
+         $<$<STREQUAL:${CRYPTO_HW_ACCELERATOR_TYPE},cc312>:CRYPTO_HW_ACCELERATOR_CC312>
+@@ -120,120 +126,3 @@ target_compile_definitions(tfm_config
+     INTERFACE
+         TFM_PARTITION_CRYPTO
+ )
+-
+-############################### TF-PSA-Crypto ##################################
+-add_library(crypto_service_tfpsacrypto_config INTERFACE)
+-
+-target_compile_definitions(crypto_service_tfpsacrypto_config
+-    INTERFACE
+-        $<$<BOOL:${TFM_TF_PSA_CRYPTO_PLATFORM_EXTRA_CONFIG_PATH}>:TF_PSA_CRYPTO_USER_CONFIG_FILE="${TFM_TF_PSA_CRYPTO_PLATFORM_EXTRA_CONFIG_PATH}">
+-        $<$<BOOL:${PLATFORM_DEFAULT_NV_SEED}>:PLATFORM_DEFAULT_NV_SEED>
+-        $<$<BOOL:${PLATFORM_DEFAULT_CRYPTO_KEYS}>:PLATFORM_DEFAULT_CRYPTO_KEYS>
+-        $<$<BOOL:${CRYPTO_TFM_BUILTIN_KEYS_DRIVER}>:PSA_CRYPTO_DRIVER_TFM_BUILTIN_KEY_LOADER>
+-        $<$<BOOL:${CRYPTO_TFM_OPAQUE_KEYS_DRIVER}>:CC3XX_CRYPTO_OPAQUE_KEYS>
+-)
+-
+-target_include_directories(crypto_service_tfpsacrypto_config
+-    INTERFACE
+-        $<$<BOOL:${CRYPTO_TFM_OPAQUE_KEYS_DRIVER}>:${PLATFORM_DIR}/ext/target/arm/drivers/cc3xx/psa_driver_api/include>
+- )
+-
+-target_link_libraries(crypto_service_tfpsacrypto_config
+-    INTERFACE
+-        tfm_config
+-        psa_crypto_library_config
+-)
+-
+-set(CMAKE_POLICY_DEFAULT_CMP0077 NEW)
+-set(CMAKE_POLICY_DEFAULT_CMP0048 NEW)
+-set(TF_PSA_CRYPTO_AS_SUBPROJECT ON)
+-set(ENABLE_TESTING OFF)
+-set(ENABLE_PROGRAMS OFF)
+-set(TF_PSA_CRYPTO_FATAL_WARNINGS OFF)
+-set(INSTALL_TF_PSA_CRYPTO_HEADERS OFF)
+-set(LIB_INSTALL_DIR ${CMAKE_CURRENT_BINARY_DIR}/tfpsacrypto/install)
+-set(GEN_FILES OFF)
+-
+-# Set the prefix to be used by TF-PSA-Crypto targets
+-set(TF_PSA_CRYPTO_TARGET_PREFIX crypto_service_)
+-
+-# If the project is configured with CMAKE_BUILD_TYPE="Debug", the value of
+-# TF_PSA_CRYPTO_BUILD_TYPE will be set "RelWithDebInfo" to optimize the space
+-# of the Debug build. If the goal is to debug TF-PSA-Crypto code itself, the
+-# TF_PSA_CRYPTO_BUILD_TYPE must be set manually here
+-set(SAVED_BUILD_TYPE ${CMAKE_BUILD_TYPE})
+-set(CMAKE_BUILD_TYPE ${TF_PSA_CRYPTO_BUILD_TYPE})
+-add_subdirectory(${TF_PSA_CRYPTO_PATH} ${CMAKE_CURRENT_BINARY_DIR}/tfpsacrypto EXCLUDE_FROM_ALL)
+-set(CMAKE_BUILD_TYPE ${SAVED_BUILD_TYPE})
+-
+-if(NOT TARGET ${TF_PSA_CRYPTO_TARGET_PREFIX}tfpsacrypto)
+-    message(FATAL_ERROR "[Crypto service] Target ${TF_PSA_CRYPTO_TARGET_PREFIX}tfpsacrypto does not exist. Have the patches in ${CMAKE_SOURCE_DIR}/lib/ext/tf-psa-crypto been applied to the TF-PSA-Crypto repo at ${TF_PSA_CRYPTO_PATH} ?
+-    Hint: The command might be `cd ${TF_PSA_CRYPTO_PATH} && git apply ${CMAKE_SOURCE_DIR}/lib/ext/tf-psa-crypto/*.patch`")
+-endif()
+-
+-target_include_directories(${TF_PSA_CRYPTO_TARGET_PREFIX}tfpsacrypto
+-    PUBLIC
+-        ${CMAKE_CURRENT_SOURCE_DIR}
+-        ${CMAKE_CURRENT_SOURCE_DIR}/psa_driver_api
+-        # The following is required for psa/error.h
+-        $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/../../../interface/include>
+-)
+-
+-# Fix platform_s and crypto_service_tfpsacrypto libraries cyclic linking
+-set_target_properties(${TF_PSA_CRYPTO_TARGET_PREFIX}tfpsacrypto PROPERTIES LINK_INTERFACE_MULTIPLICITY 3)
+-
+-target_sources(${TF_PSA_CRYPTO_TARGET_PREFIX}tfpsacrypto
+-    PRIVATE
+-        $<$<NOT:$<BOOL:${CRYPTO_HW_ACCELERATOR}>>:${CMAKE_CURRENT_SOURCE_DIR}/tfm_mbedcrypto_alt.c>
+-)
+-
+-target_compile_options(${TF_PSA_CRYPTO_TARGET_PREFIX}tfpsacrypto
+-    PRIVATE
+-        $<$<C_COMPILER_ID:GNU,Clang>:-Wno-unused-const-variable>
+-        $<$<C_COMPILER_ID:GNU,Clang>:-Wno-unused-parameter>
+-        $<$<C_COMPILER_ID:ARMClang>:-Wno-unused-const-variable>
+-        $<$<C_COMPILER_ID:ARMClang>:-Wno-unused-parameter>
+-)
+-
+-target_link_libraries(${TF_PSA_CRYPTO_TARGET_PREFIX}tfpsacrypto
+-    PRIVATE
+-        platform_s
+-    PUBLIC
+-        crypto_service_tfpsacrypto_config
+-    INTERFACE
+-        platform_common_interface
+-    )
+-
+-############################### TF-PSA-Crypto internal targets #################
+-
+-target_compile_definitions(${TF_PSA_CRYPTO_TARGET_PREFIX}p256-m
+-    PRIVATE
+-        # Code is branchless but UMLAL might take a variable amount of cycles
+-        # depedening on inputs if ${is_v8.1m} is false. We don't aim to protect
+-        # against side channel so this is a acknowledged behaviour
+-        MUL64_IS_CONSTANT_TIME
+-        MULADD64_IGNORE_ASM
+-)
+-
+-set(_tfpsa_internal_targets
+-    ${TF_PSA_CRYPTO_TARGET_PREFIX}p256-m
+-    ${TF_PSA_CRYPTO_TARGET_PREFIX}builtin
+-    ${TF_PSA_CRYPTO_TARGET_PREFIX}everest
+-    ${TF_PSA_CRYPTO_TARGET_PREFIX}platform
+-    ${TF_PSA_CRYPTO_TARGET_PREFIX}pqcp
+-    ${TF_PSA_CRYPTO_TARGET_PREFIX}utilities
+-    ${TF_PSA_CRYPTO_TARGET_PREFIX}extras
+-)
+-
+-foreach(_tfpsa_target ${_tfpsa_internal_targets})
+-    # Passing TF-PSA-Crypto configuration and required include paths to internal targets
+-    target_link_libraries(${_tfpsa_target}
+-        PRIVATE
+-            crypto_service_tfpsacrypto_config
+-    )
+-    # Propagating FPU flags to internal targets
+-    target_compile_options(${_tfpsa_target}
+-        PRIVATE
+-            ${COMPILER_CP_FLAG}
+-    )
+-endforeach()
+diff --git a/secure_fw/partitions/crypto/crypto_library.h b/secure_fw/partitions/crypto/crypto_library.h
+index e3058210f..ff26b8ca5 100644
+--- a/secure_fw/partitions/crypto/crypto_library.h
++++ b/secure_fw/partitions/crypto/crypto_library.h
+@@ -31,6 +31,21 @@ extern "C" {
+  *        is the same both in client and server views. The semantics remain
+  *        unchanged
+  */
++#if defined(TFM_CRYPTO_BACKEND_WOLFPSA)
++
++#if defined(CRYPTO_LIBRARY_ABI_COMPAT) && (CRYPTO_LIBRARY_ABI_COMPAT == 1)
++#define TFM_CRYPTO_KEY_ATTR_OFFSET_CLIENT_SERVER (0)
++#else
++#define TFM_CRYPTO_KEY_ATTR_OFFSET_CLIENT_SERVER (sizeof(wolfpsa_key_owner_id_t))
++#endif /* CRYPTO_LIBRARY_ABI_COMPAT */
++
++#define CRYPTO_LIBRARY_GET_KEY_ID(encoded_key_library) WOLFPSA_SVC_KEY_ID_GET_KEY_ID(encoded_key_library)
++#define CRYPTO_LIBRARY_GET_OWNER(encoded_key_library) WOLFPSA_SVC_KEY_ID_GET_OWNER_ID(encoded_key_library)
++
++typedef wolfpsa_svc_key_id_t tfm_crypto_library_key_id_t;
++
++#else
++
+ #if defined(CRYPTO_LIBRARY_ABI_COMPAT) && (CRYPTO_LIBRARY_ABI_COMPAT == 1)
+ #define TFM_CRYPTO_KEY_ATTR_OFFSET_CLIENT_SERVER (0)
+ #else
+@@ -55,6 +70,8 @@ extern "C" {
+  */
+ typedef mbedtls_svc_key_id_t tfm_crypto_library_key_id_t;
+ 
++#endif /* TFM_CRYPTO_BACKEND_WOLFPSA */
++
+ /**
+  * @brief Function used to initialise an object of \ref tfm_crypto_library_key_id_t to a (owner, key_id) pair
+  *
+diff --git a/secure_fw/partitions/crypto/crypto_library_wolfpsa.c b/secure_fw/partitions/crypto/crypto_library_wolfpsa.c
+new file mode 100644
+index 000000000..7bc5b836e
+--- /dev/null
++++ b/secure_fw/partitions/crypto/crypto_library_wolfpsa.c
+@@ -0,0 +1,247 @@
++#include <stddef.h>
++#include <stdint.h>
++#include <string.h>
++
++#include "tfm_log.h"
++#include "config_tfm.h"
++/* crypto_spe.h renames the PSA calls below to tfpsacrypto__* so they bind to
++ * wolfPSA's server implementation (a direct call), not the client IPC stub
++ * (which would psa_call into this partition and panic). */
++#include "crypto_spe.h"
++#include "psa/crypto.h"
++#include "psa/error.h"
++#include "crypto_library.h"
++#include "tfm_plat_crypto_keys.h"
++#include "psa_manifest/pid.h"
++
++#ifndef WOLFPSA_KEY_ID_ENCODES_OWNER
++#error "WOLFPSA_KEY_ID_ENCODES_OWNER must be set: the crypto service is a multi client PSA service"
++#endif
++
++#define WOLFPSA_MAX_BUILTIN_KEY_SIZE 96
++
++static char wolfpsa_version_full[] = "wolfPSA";
++
++/* Per-owner HKDF(HUK, info=owner) subkey, so no partition sees another's derived secret (matches the stock loader). */
++static psa_status_t wolfpsa_derive_per_owner(int32_t owner, psa_key_id_t key_id)
++{
++    psa_key_attributes_t raw_attr = PSA_KEY_ATTRIBUTES_INIT;
++    psa_key_attributes_t sub_attr = PSA_KEY_ATTRIBUTES_INIT;
++    psa_key_derivation_operation_t op = psa_key_derivation_operation_init();
++    wolfpsa_svc_key_id_t raw = wolfpsa_svc_key_id_make(TFM_SP_CRYPTO, key_id);
++    wolfpsa_svc_key_id_t per_owner = wolfpsa_svc_key_id_make(owner, key_id);
++    wolfpsa_svc_key_id_t imported = WOLFPSA_SVC_KEY_ID_INIT;
++    uint8_t subkey[WOLFPSA_MAX_BUILTIN_KEY_SIZE];
++    size_t key_bytes;
++    int32_t info_owner = owner;
++    psa_status_t status;
++
++#ifdef TFM_PARTITION_TEST_PS
++    /* PS test partition shares the real PS subkey; it calls ps_system_prepare directly. */
++    if (info_owner == TFM_SP_PS_TEST) {
++        info_owner = TFM_SP_PS;
++    }
++#endif
++
++    /* Already derived for this owner. */
++    status = psa_get_key_attributes(per_owner, &sub_attr);
++    if (status == PSA_SUCCESS) {
++        (void)psa_reset_key_attributes(&sub_attr);
++        return PSA_SUCCESS;
++    }
++
++    status = psa_get_key_attributes(raw, &raw_attr);
++    if (status != PSA_SUCCESS) {
++        return status;
++    }
++    key_bytes = PSA_BITS_TO_BYTES(psa_get_key_bits(&raw_attr));
++    if (key_bytes > sizeof(subkey)) {
++        (void)psa_reset_key_attributes(&raw_attr);
++        return PSA_ERROR_INSUFFICIENT_MEMORY;
++    }
++
++    status = psa_key_derivation_setup(&op, PSA_ALG_HKDF(PSA_ALG_SHA_256));
++    if (status == PSA_SUCCESS) {
++        status = psa_key_derivation_input_key(&op,
++                     PSA_KEY_DERIVATION_INPUT_SECRET, raw);
++    }
++    if (status == PSA_SUCCESS) {
++        status = psa_key_derivation_input_bytes(&op,
++                     PSA_KEY_DERIVATION_INPUT_INFO,
++                     (const uint8_t *)&info_owner, sizeof(info_owner));
++    }
++    if (status == PSA_SUCCESS) {
++        status = psa_key_derivation_output_bytes(&op, subkey, key_bytes);
++    }
++    (void)psa_key_derivation_abort(&op);
++
++    if (status == PSA_SUCCESS) {
++        (void)psa_reset_key_attributes(&sub_attr);
++        sub_attr.id = per_owner;
++        psa_set_key_type(&sub_attr, psa_get_key_type(&raw_attr));
++        psa_set_key_bits(&sub_attr, psa_get_key_bits(&raw_attr));
++        psa_set_key_algorithm(&sub_attr, psa_get_key_algorithm(&raw_attr));
++        psa_set_key_usage_flags(&sub_attr, psa_get_key_usage_flags(&raw_attr));
++        status = psa_import_key(&sub_attr, subkey, key_bytes, &imported);
++    }
++
++    (void)memset(subkey, 0, sizeof(subkey));
++    (void)psa_reset_key_attributes(&raw_attr);
++    return status;
++}
++
++/* Materialise the per-owner subkey lazily, so the owner-0 fallback never hands out the raw key. */
++static void wolfpsa_ensure_derived_builtin(int32_t owner, psa_key_id_t key_id)
++{
++    const tfm_plat_builtin_key_policy_t *policy_table = NULL;
++    size_t number_of_policies;
++    size_t pol;
++
++    if (owner == TFM_SP_CRYPTO) {
++        return;
++    }
++
++    number_of_policies = tfm_plat_builtin_key_get_policy_table_ptr(&policy_table);
++    for (pol = 0; pol < number_of_policies; pol++) {
++        if ((policy_table[pol].key_id == key_id) &&
++            (policy_table[pol].per_user_policy == 0) &&
++            ((policy_table[pol].usage & PSA_KEY_USAGE_DERIVE) != 0)) {
++            (void)wolfpsa_derive_per_owner(owner, key_id);
++            break;
++        }
++    }
++}
++
++tfm_crypto_library_key_id_t tfm_crypto_library_key_id_init(int32_t owner,
++                                                           psa_key_id_t key_id)
++{
++    wolfpsa_ensure_derived_builtin(owner, key_id);
++    return wolfpsa_svc_key_id_make(owner, key_id);
++}
++
++char *tfm_crypto_library_get_info(void)
++{
++    return wolfpsa_version_full;
++}
++
++void tfm_crypto_library_get_library_key_id_set_owner(int32_t owner,
++                                                     psa_key_attributes_t *attr)
++{
++    wolfpsa_set_key_owner_id(attr, owner);
++}
++
++/* wolfPSA has no builtin key driver, so the platform's keys are read out with
++ * the loader in their descriptor and imported once at init. The material stays
++ * inside this partition. */
++static psa_status_t wolfpsa_import_one_builtin(int32_t owner,
++        psa_key_id_t key_id, psa_key_type_t type, psa_key_bits_t bits,
++        psa_algorithm_t alg, psa_key_usage_t usage,
++        const uint8_t *key_buf, size_t key_len)
++{
++    psa_key_attributes_t attr = PSA_KEY_ATTRIBUTES_INIT;
++    wolfpsa_svc_key_id_t imported = WOLFPSA_SVC_KEY_ID_INIT;
++    psa_status_t status;
++
++    /* Volatile under (owner, key_id): wolfpsa_volatile_find() matches (owner,
++     * key_id) exactly before the owner-0 fallback, so each caller resolves to
++     * its own policy. See the id-not-psa_set_key_id note below. */
++    attr.id = wolfpsa_svc_key_id_make(owner, key_id);
++    psa_set_key_type(&attr, type);
++    psa_set_key_bits(&attr, bits);
++    psa_set_key_algorithm(&attr, alg);
++    psa_set_key_usage_flags(&attr, usage);
++
++    status = psa_import_key(&attr, key_buf, key_len, &imported);
++    if (status != PSA_SUCCESS) {
++        ERROR("[Crypto] Failed to import builtin key 0x%x owner %d\n",
++              (unsigned)key_id, (int)owner);
++    }
++    return status;
++}
++
++static psa_status_t wolfpsa_import_builtin_keys(void)
++{
++    const tfm_plat_builtin_key_descriptor_t *desc_table = NULL;
++    const tfm_plat_builtin_key_policy_t *policy_table = NULL;
++    uint8_t key_buf[WOLFPSA_MAX_BUILTIN_KEY_SIZE];
++    size_t number_of_keys;
++    size_t number_of_policies;
++    size_t idx;
++    size_t pol;
++    psa_status_t status = PSA_SUCCESS;
++
++    number_of_keys = tfm_plat_builtin_key_get_desc_table_ptr(&desc_table);
++    number_of_policies = tfm_plat_builtin_key_get_policy_table_ptr(&policy_table);
++
++    for (idx = 0; (status == PSA_SUCCESS) && (idx < number_of_keys); idx++) {
++        const tfm_plat_builtin_key_descriptor_t *desc = &desc_table[idx];
++        psa_key_bits_t key_bits = 0;
++        psa_algorithm_t alg = 0;
++        psa_key_type_t type = 0;
++        size_t key_len = 0;
++
++        if (desc->loader_key_func == NULL) {
++            continue;
++        }
++
++        if (desc->loader_key_func(desc->loader_key_ctx, key_buf,
++                                  sizeof(key_buf), &key_len, &key_bits,
++                                  &alg, &type) != TFM_PLAT_ERR_SUCCESS) {
++            status = PSA_ERROR_HARDWARE_FAILURE;
++            break;
++        }
++
++        /* Import one key per authorized owner with that owner's exact usage, not
++         * a union under owner 0. Unioning would let any caller inherit another
++         * partition's rights (e.g. a non-secure caller signing with the IAK,
++         * which the platform policy grants only to the attestation partition).
++         * Keys with no per-user policy import once under owner 0 (global).
++         * The id is set directly (not psa_set_key_id, which would promote the
++         * key to persistent and pull in ITS IPC during crypto init); keeping it
++         * volatile re-provisions it in RAM under the builtin id every boot. */
++        for (pol = 0; (status == PSA_SUCCESS) && (pol < number_of_policies);
++             pol++) {
++            if (policy_table[pol].key_id != desc->key_id) {
++                continue;
++            }
++            if (policy_table[pol].per_user_policy == 0) {
++                /* A global DERIVE builtin (HUK) stays under the crypto partition; non-DERIVE globals stay owner 0. */
++                int32_t import_owner = 0;
++                if ((policy_table[pol].usage & PSA_KEY_USAGE_DERIVE) != 0) {
++                    import_owner = TFM_SP_CRYPTO;
++                }
++                status = wolfpsa_import_one_builtin(import_owner, desc->key_id,
++                             type, key_bits, alg, policy_table[pol].usage,
++                             key_buf, key_len);
++            }
++            else {
++                size_t user;
++                for (user = 0; (status == PSA_SUCCESS) &&
++                     (user < policy_table[pol].per_user_policy); user++) {
++                    status = wolfpsa_import_one_builtin(
++                                 policy_table[pol].policy_ptr[user].user,
++                                 desc->key_id, type, key_bits, alg,
++                                 policy_table[pol].policy_ptr[user].usage,
++                                 key_buf, key_len);
++                }
++            }
++        }
++
++        (void)memset(key_buf, 0, sizeof(key_buf));
++    }
++
++    return status;
++}
++
++psa_status_t tfm_crypto_core_library_init(void)
++{
++    psa_status_t status;
++
++    status = psa_crypto_init();
++    if (status == PSA_SUCCESS) {
++        /* Safe now: with crypto_spe.h, psa_import_key binds to wolfPSA's server
++         * implementation directly rather than the client IPC stub. */
++        status = wolfpsa_import_builtin_keys();
++    }
++    return status;
++}
+diff --git a/secure_fw/partitions/crypto/psa_driver_api/tfm_builtin_key_loader.h b/secure_fw/partitions/crypto/psa_driver_api/tfm_builtin_key_loader.h
+index 26885da47..bf6a4a9d1 100644
+--- a/secure_fw/partitions/crypto/psa_driver_api/tfm_builtin_key_loader.h
++++ b/secure_fw/partitions/crypto/psa_driver_api/tfm_builtin_key_loader.h
+@@ -9,6 +9,7 @@
+ #define TFM_BUILTIN_KEY_LOADER_H
+ 
+ #include <psa/crypto.h>
++#include "crypto_library.h"
+ 
+ #ifdef __cplusplus
+ extern "C" {
+@@ -75,7 +76,7 @@ psa_status_t tfm_builtin_key_loader_init(void);
+  * \return Returns error code specified in \ref psa_status_t
+  */
+ psa_status_t tfm_builtin_key_loader_get_key_buffer_size(
+-        mbedtls_svc_key_id_t key_id, size_t *len);
++        tfm_crypto_library_key_id_t key_id, size_t *len);
+ 
+ /**
+  * \brief Returns the attributes and key material of a key from the builtin
+diff --git a/secure_fw/partitions/crypto/tfm_mbedcrypto_include.h b/secure_fw/partitions/crypto/tfm_mbedcrypto_include.h
+index e2b14238e..d527719c7 100644
+--- a/secure_fw/partitions/crypto/tfm_mbedcrypto_include.h
++++ b/secure_fw/partitions/crypto/tfm_mbedcrypto_include.h
+@@ -11,9 +11,9 @@
+ /* Define PSA_CRYPTO_SECURE to signal that we are compiling for the SPE */
+ #define PSA_CRYPTO_SECURE 1
+ 
+-/* Include the crypto_spe.h header before including the PSA Crypto header from
+- * Mbed Crypto
+- */
++/* crypto_spe.h renames the service's PSA calls to tfpsacrypto__* so they bind to
++ * the crypto backend, not the client IPC stub. Every backend, including wolfPSA,
++ * must go through it or the service recurses into itself over IPC. */
+ #include "crypto_spe.h"
+ #include "psa/crypto.h"
+ 
+diff --git a/secure_fw/partitions/lib/runtime/CMakeLists.txt b/secure_fw/partitions/lib/runtime/CMakeLists.txt
+index be7d57b26..1ac440249 100644
+--- a/secure_fw/partitions/lib/runtime/CMakeLists.txt
++++ b/secure_fw/partitions/lib/runtime/CMakeLists.txt
+@@ -16,6 +16,13 @@ target_include_directories(tfm_sprt
+         ${CMAKE_SOURCE_DIR}/secure_fw/include
+ )
+ 
++# tfm_crypto_api.c (compiled here) includes psa/crypto_platform.h, which pulls the
++# wolfPSA renaming shim; the backend must be known here.
++target_compile_definitions(tfm_sprt
++    PRIVATE
++        TFM_CRYPTO_BACKEND_WOLFPSA
++)
++
+ target_sources(tfm_sprt
+     PUBLIC
+         $<$<C_COMPILER_ID:GNU>:${CMAKE_SOURCE_DIR}/platform/ext/common/syscalls_stub.c>
