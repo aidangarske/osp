@@ -1,0 +1,1118 @@
+diff --git a/lib/ext/CMakeLists.txt b/lib/ext/CMakeLists.txt
+index 06e952ac9..a9245afdc 100644
+--- a/lib/ext/CMakeLists.txt
++++ b/lib/ext/CMakeLists.txt
+@@ -8,7 +8,7 @@ set(FETCHCONTENT_BASE_DIR ${CMAKE_BINARY_DIR}/lib/ext CACHE STRING "" FORCE)
+ 
+ add_subdirectory(qcbor)
+ add_subdirectory(tf-psa-crypto)
+-add_subdirectory(t_cose)
++add_subdirectory(wolfcose)
+ add_subdirectory(cmsis)
+ add_subdirectory(efi_soft_crc)
+ if (${PLATFORM_PSA_ADAC_SECURE_DEBUG})
+diff --git a/lib/ext/wolfcose/CMakeLists.txt b/lib/ext/wolfcose/CMakeLists.txt
+new file mode 100644
+index 000000000..7e3f6a4c2
+--- /dev/null
++++ b/lib/ext/wolfcose/CMakeLists.txt
+@@ -0,0 +1,105 @@
++if (NOT TFM_PARTITION_INITIAL_ATTESTATION)
++    return()
++endif()
++
++cmake_minimum_required(VERSION 3.21)
++
++if (NOT WOLFCOSE_PATH OR NOT EXISTS ${WOLFCOSE_PATH})
++    message(FATAL_ERROR "WOLFCOSE_PATH = '${WOLFCOSE_PATH}' is not set or does not exist. "
++                        "Provide the path to a wolfCOSE checkout with -DWOLFCOSE_PATH=")
++endif()
++
++add_library(wolfcose_s STATIC EXCLUDE_FROM_ALL)
++
++target_sources(wolfcose_s
++    PRIVATE
++        ${WOLFCOSE_PATH}/src/wolfcose.c
++        ${WOLFCOSE_PATH}/src/wolfcose_cbor.c
++)
++
++target_include_directories(wolfcose_s
++    PUBLIC
++        ${WOLFCOSE_PATH}/include
++    PRIVATE
++        ${WOLFCOSE_PATH}/src
++)
++
++target_compile_definitions(wolfcose_s
++    PUBLIC
++        WOLFCOSE_ENABLE_EXT_SIGN
++    PRIVATE
++        WOLFSSL_IGNORE_FILE_WARN
++)
++
++target_compile_options(wolfcose_s
++    PRIVATE
++        ${COMPILER_CP_FLAG}
++        -Wno-unused-parameter
++)
++
++if(TARGET crypto_service_wolfpsa)
++    # Combined with wolfPSA: wolfCrypt is already in the image. Share it instead
++    # of compiling a second copy, or the two partitions each define wc_Hash /
++    # sp_int / ecc and the image fails to link on duplicate symbols. wolfcose.c
++    # only calls wolfCrypt; using wolfPSA's user_settings gives it the matching
++    # struct ABI so the shared symbols resolve correctly. PUBLIC so the partition
++    # sources that include wolfcose.h (attest_token_encode.c) see the same ABI.
++    target_include_directories(wolfcose_s
++        PUBLIC
++            ${CMAKE_CURRENT_LIST_DIR}/../wolfpsa
++            ${WOLFSSL_PATH}
++    )
++    target_compile_definitions(wolfcose_s
++        PUBLIC
++            WOLFSSL_USER_SETTINGS
++    )
++    target_link_libraries(wolfcose_s
++        PRIVATE
++            crypto_service_wolfpsa
++            psa_crypto_config
++            psa_interface
++            platform_s
++            tfm_config
++    )
++else()
++    if (NOT WOLFSSL_PATH OR NOT EXISTS ${WOLFSSL_PATH})
++        message(FATAL_ERROR "WOLFSSL_PATH = '${WOLFSSL_PATH}' is not set or does not exist. "
++                            "wolfCOSE needs wolfCrypt headers and SHA-256. Use -DWOLFSSL_PATH=")
++    endif()
++
++    target_sources(wolfcose_s
++        PRIVATE
++            ${WOLFSSL_PATH}/wolfcrypt/src/hash.c
++            ${WOLFSSL_PATH}/wolfcrypt/src/sha256.c
++            ${WOLFSSL_PATH}/wolfcrypt/src/wc_port.c
++            ${WOLFSSL_PATH}/wolfcrypt/src/memory.c
++            ${WOLFSSL_PATH}/wolfcrypt/src/wolfmath.c
++            ${WOLFSSL_PATH}/wolfcrypt/src/ecc.c
++            ${WOLFSSL_PATH}/wolfcrypt/src/asn.c
++            ${WOLFSSL_PATH}/wolfcrypt/src/coding.c
++            ${WOLFSSL_PATH}/wolfcrypt/src/sp_int.c
++            ${WOLFSSL_PATH}/wolfcrypt/src/sp_c32.c
++            ${WOLFSSL_PATH}/wolfcrypt/src/random.c
++            ${WOLFSSL_PATH}/wolfcrypt/src/logging.c
++            ${WOLFSSL_PATH}/wolfcrypt/src/misc.c
++    )
++
++    target_include_directories(wolfcose_s
++        PUBLIC
++            ${CMAKE_CURRENT_LIST_DIR}
++            ${WOLFSSL_PATH}
++    )
++
++    target_compile_definitions(wolfcose_s
++        PUBLIC
++            WOLFSSL_USER_SETTINGS
++    )
++
++    target_link_libraries(wolfcose_s
++        PRIVATE
++            psa_crypto_config
++            psa_interface
++            platform_s
++            tfm_config
++    )
++endif()
+diff --git a/lib/ext/wolfcose/user_settings.h b/lib/ext/wolfcose/user_settings.h
+new file mode 100644
+index 000000000..f66dbabd4
+--- /dev/null
++++ b/lib/ext/wolfcose/user_settings.h
+@@ -0,0 +1,64 @@
++#ifndef __WOLFCOSE_TFM_USER_SETTINGS_H__
++#define __WOLFCOSE_TFM_USER_SETTINGS_H__
++
++#ifdef __cplusplus
++extern "C" {
++#endif
++
++/* wolfSSL builds gnu11, where anonymous inline aggregates are on. TF-M's
++ * toolchain files force -std=c99, which turns them off and silently shrinks
++ * WC_RNG. Keep this even though the delegated path links no RNG. */
++#define HAVE_ANONYMOUS_INLINE_AGGREGATES 1
++
++#define WOLFCRYPT_ONLY
++#define SINGLE_THREADED
++#define NO_FILESYSTEM
++#define NO_WRITEV
++#define WOLFSSL_NO_SOCK
++#define NO_ERROR_STRINGS
++#define NO_WOLFSSL_DIR
++
++/* The attestation partition has no heap. WOLFSSL_SMALL_STACK must stay off: it
++ * moves large buffers to the heap, which is exactly what is missing here. */
++#define WOLFSSL_NO_MALLOC
++#define NO_WOLFSSL_MEMORY
++
++/* wolfCOSE pre-hashes the Sig_structure with wc_Hash(SHA-256); the signature
++ * itself is delegated to psa_sign_hash, so no RNG is needed here. */
++#define WOLFSSL_SHA256
++#define NO_SHA
++#define NO_MD4
++#define NO_MD5
++#define WOLFSSL_NO_SHAKE128
++#define WOLFSSL_NO_SHAKE256
++
++#define NO_DH
++#define NO_DSA
++#define NO_DES3
++#define NO_RC4
++#define NO_AES
++#define NO_HMAC
++#define NO_PWDBASED
++#define NO_PKCS12
++#define NO_PKCS8
++#define WOLFSSL_ASN_TEMPLATE
++#define NO_CERTS
++#define NO_RSA
++#define NO_SESSION_CACHE
++#define NO_OLD_TLS
++
++/* ES256 framing only. wolfCOSE gates COSE_Sign1 on HAVE_ECC, so ECC must be
++ * enabled even though psa_sign_hash performs the signature. */
++/* Key export stays enabled: wc_CoseKey_Encode uses wc_ecc_export_public_raw to
++ * emit the COSE_Key that the Instance ID hashes over. */
++#define HAVE_ECC
++#define ECC_USER_CURVES
++#define HAVE_ECC256
++#define ECC_TIMING_RESISTANT
++#define TFM_TIMING_RESISTANT
++
++#ifdef __cplusplus
++}
++#endif
++
++#endif /* __WOLFCOSE_TFM_USER_SETTINGS_H__ */
+diff --git a/secure_fw/partitions/initial_attestation/CMakeLists.txt b/secure_fw/partitions/initial_attestation/CMakeLists.txt
+index 7d0f5c9de..61876564c 100644
+--- a/secure_fw/partitions/initial_attestation/CMakeLists.txt
++++ b/secure_fw/partitions/initial_attestation/CMakeLists.txt
+@@ -43,6 +43,8 @@ target_include_directories(tfm_psa_rot_partition_attestation
+         .
+     PRIVATE
+         ${CMAKE_BINARY_DIR}/generated/secure_fw/partitions/initial_attestation
++        ${WOLFCOSE_PATH}/include
++        ${WOLFSSL_PATH}
+ )
+ target_include_directories(tfm_partitions
+     INTERFACE
+@@ -53,7 +55,7 @@ target_link_libraries(tfm_psa_rot_partition_attestation
+     PRIVATE
+         platform_s
+         tfm_config
+-        tfm_t_cose_s
++        wolfcose_s
+         tfm_sprt
+         tfm_boot_status
+         qcbor
+diff --git a/secure_fw/partitions/initial_attestation/attest_asymmetric_key.c b/secure_fw/partitions/initial_attestation/attest_asymmetric_key.c
+index 5630d24c7..548c8c589 100644
+--- a/secure_fw/partitions/initial_attestation/attest_asymmetric_key.c
++++ b/secure_fw/partitions/initial_attestation/attest_asymmetric_key.c
+@@ -11,9 +11,8 @@
+ #include "attest_key.h"
+ #include "config_tfm.h"
+ #include "psa/crypto.h"
+-#include "t_cose/q_useful_buf.h"
+-#include "t_cose/t_cose_common.h"
+-#include "t_cose/t_cose_key.h"
++#include "qcbor/UsefulBuf.h"
++#include "attest_token.h"
+ #include "tfm_crypto_defs.h"
+ 
+ /**
+@@ -51,18 +50,12 @@ static struct q_useful_buf attest_key_hash = { .ptr = instance_id_buf + 1,
+  */
+ static enum psa_attest_err_t compute_attest_key_hash(void)
+ {
+-    Q_USEFUL_BUF_MAKE_STACK_UB(public_key_buf, MAX_ENCODED_COSE_KEY_SIZE);
+-    struct t_cose_key attest_key;
++    UsefulBuf_MAKE_STACK_UB(public_key_buf, MAX_ENCODED_COSE_KEY_SIZE);
+     struct q_useful_buf_c cose_key;
+     psa_status_t psa_res;
+-    enum t_cose_err_t cose_res;
+ 
+-    attest_key.key.handle = TFM_BUILTIN_KEY_ID_IAK;
+-
+-    cose_res = t_cose_key_encode(attest_key,
+-                                 public_key_buf,
+-                                 &cose_key);
+-    if (cose_res != T_COSE_SUCCESS) {
++    if (attest_encode_cose_key(TFM_BUILTIN_KEY_ID_IAK, public_key_buf,
++                               &cose_key) != 0) {
+         return PSA_ATTEST_ERR_CLAIM_UNAVAILABLE;
+     }
+ 
+diff --git a/secure_fw/partitions/initial_attestation/attest_boot_data.c b/secure_fw/partitions/initial_attestation/attest_boot_data.c
+index 37ebd26d6..410134886 100644
+--- a/secure_fw/partitions/initial_attestation/attest_boot_data.c
++++ b/secure_fw/partitions/initial_attestation/attest_boot_data.c
+@@ -11,7 +11,7 @@
+ #include "attest_boot_data.h"
+ #include "tfm_boot_status.h"
+ #include "tfm_attest_iat_defs.h"
+-#include "t_cose/q_useful_buf.h"
++#include "qcbor/UsefulBuf.h"
+ #ifdef TFM_PARTITION_MEASURED_BOOT
+ #include "measured_boot_api.h"
+ #include "tfm_boot_measurement.h"
+@@ -218,11 +218,11 @@ attest_encode_sw_components_array(QCBOREncodeContext *encode_ctx,
+ #ifdef TFM_PARTITION_MEASURED_BOOT
+     uint8_t slot_index;
+ 
+-    Q_USEFUL_BUF_MAKE_STACK_UB(measurement_buf, MEASUREMENT_VALUE_MAX_SIZE);
+-    Q_USEFUL_BUF_MAKE_STACK_UB(signer_id_buf, SIGNER_ID_MAX_SIZE);
+-    Q_USEFUL_BUF_MAKE_STACK_UB(sw_version_buf, VERSION_MAX_SIZE);
+-    Q_USEFUL_BUF_MAKE_STACK_UB(sw_type_buf, SW_TYPE_MAX_SIZE);
+-    struct q_useful_buf_c measurement_desc = NULL_Q_USEFUL_BUF_C;
++    UsefulBuf_MAKE_STACK_UB(measurement_buf, MEASUREMENT_VALUE_MAX_SIZE);
++    UsefulBuf_MAKE_STACK_UB(signer_id_buf, SIGNER_ID_MAX_SIZE);
++    UsefulBuf_MAKE_STACK_UB(sw_version_buf, VERSION_MAX_SIZE);
++    UsefulBuf_MAKE_STACK_UB(sw_type_buf, SW_TYPE_MAX_SIZE);
++    struct q_useful_buf_c measurement_desc = NULLUsefulBufC;
+     uint32_t measurement_algo;
+     bool is_locked;
+     enum psa_attest_err_t err;
+@@ -290,7 +290,7 @@ attest_encode_sw_components_array(QCBOREncodeContext *encode_ctx,
+     }
+ 
+ #else /* TFM_PARTITION_MEASURED_BOOT */
+-    struct q_useful_buf_c encoded_const = NULL_Q_USEFUL_BUF_C;
++    struct q_useful_buf_c encoded_const = NULLUsefulBufC;
+     uint16_t tlv_len;
+     uint8_t *tlv_ptr;
+     uint8_t  tlv_id;
+diff --git a/secure_fw/partitions/initial_attestation/attest_core.c b/secure_fw/partitions/initial_attestation/attest_core.c
+index 92d106326..dc017c1b2 100644
+--- a/secure_fw/partitions/initial_attestation/attest_core.c
++++ b/secure_fw/partitions/initial_attestation/attest_core.c
+@@ -13,13 +13,14 @@
+ #include "attest_boot_data.h"
+ #include "attest_key.h"
+ #include "attest_token.h"
++#include "attest_token_encode.h"
+ #include "config_tfm.h"
+ #include "tfm_plat_defs.h"
+ #include "tfm_plat_device_id.h"
+ #include "tfm_plat_boot_seed.h"
+ #include "tfm_attest_hal.h"
+ #include "tfm_attest_iat_defs.h"
+-#include "t_cose/t_cose_common.h"
++#include "wolfcose/wolfcose.h"
+ #include "tfm_crypto_defs.h"
+ #include "tfm_log.h"
+ #include "tfm_string.h"
+@@ -508,7 +509,7 @@ static enum psa_attest_err_t attest_verify_challenge_size(size_t challenge_size)
+     return PSA_ATTEST_ERR_INVALID_INPUT;
+ }
+ 
+-static enum psa_attest_err_t attest_get_t_cose_algorithm(
++static enum psa_attest_err_t attest_get_cose_algorithm(
+         int32_t *cose_algorithm_id)
+ {
+     psa_status_t status;
+@@ -530,13 +531,13 @@ static enum psa_attest_err_t attest_get_t_cose_algorithm(
+         (PSA_KEY_TYPE_ECC_GET_FAMILY(key_type) == PSA_ECC_FAMILY_SECP_R1)) {
+         switch (psa_get_key_bits(&attr)) {
+         case 256:
+-            *cose_algorithm_id = T_COSE_ALGORITHM_ES256;
++            *cose_algorithm_id = WOLFCOSE_ALG_ES256;
+             break;
+         case 384:
+-            *cose_algorithm_id = T_COSE_ALGORITHM_ES384;
++            *cose_algorithm_id = WOLFCOSE_ALG_ES384;
+             break;
+         case 512:
+-            *cose_algorithm_id = T_COSE_ALGORITHM_ES512;
++            *cose_algorithm_id = WOLFCOSE_ALG_ES512;
+             break;
+         default:
+             return PSA_ATTEST_ERR_GENERAL;
+@@ -544,13 +545,13 @@ static enum psa_attest_err_t attest_get_t_cose_algorithm(
+     } else if (key_type == PSA_KEY_TYPE_HMAC) {
+         switch (psa_get_key_bits(&attr)) {
+         case 256:
+-            *cose_algorithm_id = T_COSE_ALGORITHM_HMAC256;
++            *cose_algorithm_id = WOLFCOSE_ALG_HMAC256;
+             break;
+         case 384:
+-            *cose_algorithm_id = T_COSE_ALGORITHM_HMAC384;
++            *cose_algorithm_id = WOLFCOSE_ALG_HMAC384;
+             break;
+         case 512:
+-            *cose_algorithm_id = T_COSE_ALGORITHM_HMAC512;
++            *cose_algorithm_id = WOLFCOSE_ALG_HMAC512;
+             break;
+         default:
+             return PSA_ATTEST_ERR_GENERAL;
+@@ -614,12 +615,14 @@ attest_create_token(struct q_useful_buf_c *challenge,
+ {
+     enum psa_attest_err_t attest_err = PSA_ATTEST_ERR_SUCCESS;
+     enum attest_token_err_t token_err;
+-    struct attest_token_encode_ctx attest_token_ctx;
++    /* Static: the ctx embeds a WOLFCOSE_KEY, which can be large depending on
++     * the wolfCrypt build; keep it off the small partition stack. */
++    static struct attest_token_encode_ctx attest_token_ctx;
+     int32_t key_select = 0;
+     int i;
+     int32_t cose_algorithm_id;
+ 
+-    attest_err = attest_get_t_cose_algorithm(&cose_algorithm_id);
++    attest_err = attest_get_cose_algorithm(&cose_algorithm_id);
+     if (attest_err != PSA_ATTEST_ERR_SUCCESS) {
+         return attest_err;
+     }
+@@ -704,9 +707,12 @@ initial_attest_get_token_size(size_t challenge_size, size_t *token_size)
+     struct q_useful_buf_c challenge;
+     struct q_useful_buf token;
+     struct q_useful_buf_c completed_token;
++    /* wolfCOSE encodes claims into a real buffer, so the nonce claim is copied
++     * even in the size path; provide zeroed bytes rather than a NULL pointer. */
++    static const uint8_t zero_challenge[PSA_INITIAL_ATTEST_CHALLENGE_SIZE_64];
+ 
+     /* Only the size of the challenge is needed */
+-    challenge.ptr = NULL;
++    challenge.ptr = zero_challenge;
+     challenge.len = challenge_size;
+ 
+     /* Special value to get the size of the token, but token is not created */
+diff --git a/secure_fw/partitions/initial_attestation/attest_key.h b/secure_fw/partitions/initial_attestation/attest_key.h
+index ae17c59cb..9d0737f3e 100644
+--- a/secure_fw/partitions/initial_attestation/attest_key.h
++++ b/secure_fw/partitions/initial_attestation/attest_key.h
+@@ -12,7 +12,7 @@
+ #include "config_tfm.h"
+ #include "psa/initial_attestation.h"
+ #include "psa/crypto.h"
+-#include "t_cose/q_useful_buf.h"
++#include "qcbor/UsefulBuf.h"
+ 
+ #ifdef __cplusplus
+ extern "C" {
+@@ -51,7 +51,7 @@ attest_get_initial_attestation_key_id(struct q_useful_buf_c *attest_key_id);
+ static inline enum psa_attest_err_t
+ attest_get_initial_attestation_key_id(struct q_useful_buf_c *attest_key_id)
+ {
+-    *attest_key_id = NULL_Q_USEFUL_BUF_C;
++    *attest_key_id = NULLUsefulBufC;
+     return PSA_ATTEST_ERR_SUCCESS;
+ }
+ #endif /* ATTEST_INCLUDE_COSE_KEY_ID */
+diff --git a/secure_fw/partitions/initial_attestation/attest_token.h b/secure_fw/partitions/initial_attestation/attest_token.h
+index a7de3c8ac..2b5c3c275 100644
+--- a/secure_fw/partitions/initial_attestation/attest_token.h
++++ b/secure_fw/partitions/initial_attestation/attest_token.h
+@@ -15,16 +15,16 @@
+ 
+ #include <stdint.h>
+ #include "qcbor/qcbor.h"
+-#ifdef SYMMETRIC_INITIAL_ATTESTATION
+-#include "t_cose/t_cose_mac_compute.h"
+-#else
+-#include "t_cose/t_cose_sign1_sign.h"
+-#endif
++#include "psa/crypto.h"
+ 
+ #ifdef __cplusplus
+ extern "C" {
+ #endif
+ 
++int attest_encode_cose_key(psa_key_id_t key_id,
++                           struct q_useful_buf buf,
++                           struct q_useful_buf_c *cose_key);
++
+ /**
+  * \file attest_token.h
+  *
+@@ -104,18 +104,10 @@ enum attest_token_err_t {
+  *
+  * The structure is opaque for the caller.
+  *
+- * This is roughly 148 + 4 + 32 = 184 bytes
++ * The full definition lives in attest_token_encode.h so that consumers which
++ * only need the token API (e.g. the test suite) do not pull in wolfCOSE.
+  */
+-struct attest_token_encode_ctx {
+-    /* Private data structure */
+-    QCBOREncodeContext           cbor_enc_ctx;
+-    int32_t                      key_select;
+-#ifdef SYMMETRIC_INITIAL_ATTESTATION
+-    struct t_cose_mac_calculate_ctx  mac_ctx;
+-#else
+-    struct t_cose_sign1_sign_ctx     signer_ctx;
+-#endif
+-};
++struct attest_token_encode_ctx;
+ 
+ /**
+  * \brief Initialize a token creation context.
+@@ -138,11 +130,11 @@ struct attest_token_encode_ctx {
+  * signing key size. It is about 150 bytes for 256-bit ECDSA.
+  *
+  * If \c out_buf->ptr is \c NULL and \c out_buf->len is
+- * large like \c UINT32_MAX no token will be created but the length of
+- * the token that would be created will be in \c completed_token as
+- * returned by attest_token_encode_finish(). None of the cryptographic
+- * functions run during this, but the sizes of what they would output
+- * is taken into account.
++ * large like \c UINT32_MAX no token is returned but its length is placed
++ * in \c completed_token by attest_token_encode_finish(). The wolfCOSE
++ * backend has no size-only mode, so it builds and signs the token into an
++ * internal buffer to obtain the length: the crypto partition must be
++ * available and a size query can fail on a signing error.
+  */
+ enum attest_token_err_t
+ attest_token_encode_start(struct attest_token_encode_ctx *me,
+diff --git a/secure_fw/partitions/initial_attestation/attest_token_encode.c b/secure_fw/partitions/initial_attestation/attest_token_encode.c
+index d72d9880f..6675ee23b 100644
+--- a/secure_fw/partitions/initial_attestation/attest_token_encode.c
++++ b/secure_fw/partitions/initial_attestation/attest_token_encode.c
+@@ -1,229 +1,81 @@
+-/*
+- * attest_token_encode.c
+- *
+- * Copyright (c) 2018-2019, Laurence Lundblade. All rights reserved.
+- *
+- * SPDX-FileCopyrightText: Copyright The TrustedFirmware-M Contributors
+- *
+- * SPDX-License-Identifier: BSD-3-Clause
+- *
+- * See BSD-3-Clause license in README.md
+- */
+-
+ #include "attest_token.h"
++#include "attest_token_encode.h"
+ #include "config_tfm.h"
+ #include "qcbor/qcbor.h"
+-#ifdef SYMMETRIC_INITIAL_ATTESTATION
+-#include "t_cose/t_cose_mac_compute.h"
+-#else
+-#include "t_cose/t_cose_sign1_sign.h"
+-#endif
+-#include "t_cose/t_cose_common.h"
+-#include "t_cose/q_useful_buf.h"
+ #include "psa/crypto.h"
+ #include "attest_key.h"
+ #include "tfm_crypto_defs.h"
++#include <string.h>
++#include <wolfssl/wolfcrypt/ecc.h>
+ 
++#ifdef SYMMETRIC_INITIAL_ATTESTATION
++#error "The wolfCOSE backend does not implement COSE_Mac0 attestation yet."
++#endif
+ 
+-/**
+- * \file attest_token_encode.c
+- *
+- * \brief Attestation token creation implementation
+- */
+-
+-/**
+- * \brief Map t_cose error to attestation token error.
+- *
+- * \param[in] err   The t_cose error to map.
+- *
+- * \return the attestation token error.
+- */
+-static enum attest_token_err_t t_cose_err_to_attest_err(enum t_cose_err_t err)
+-{
+-    switch(err) {
++/* One request is in flight per partition, so the claim set and the
++ * Sig_structure scratch are file scope rather than on the 2 KB partition
++ * stack. */
++static uint8_t attest_claims_buf[PSA_INITIAL_ATTEST_MAX_TOKEN_SIZE];
++static uint8_t attest_scratch_buf[PSA_INITIAL_ATTEST_MAX_TOKEN_SIZE +
++                                  WOLFCOSE_MAX_SCRATCH_SZ];
+ 
+-    case T_COSE_SUCCESS:
+-        return ATTEST_TOKEN_ERR_SUCCESS;
++/* psa_initial_attest_get_token_size() asks how large the token would be by
++ * passing a NULL out_buf (see attest_token.h). t_cose answers that from a size
++ * calculation mode; wolfCOSE has no such mode, so the token is built here
++ * instead and only its length reported. */
++static uint8_t attest_sizing_buf[PSA_INITIAL_ATTEST_MAX_TOKEN_SIZE];
+ 
+-    case T_COSE_ERR_UNSUPPORTED_HASH:
+-        return ATTEST_TOKEN_ERR_HASH_UNAVAILABLE;
++static enum attest_token_err_t wolfcose_err_to_attest_err(int err)
++{
++    switch (err) {
++    case WOLFCOSE_SUCCESS:
++        return ATTEST_TOKEN_ERR_SUCCESS;
+ 
+-    case T_COSE_ERR_TOO_SMALL:
++    case WOLFCOSE_E_BUFFER_TOO_SMALL:
+         return ATTEST_TOKEN_ERR_TOO_SMALL;
+ 
++    case WOLFCOSE_E_COSE_BAD_ALG:
++        return ATTEST_TOKEN_ERR_UNSUPPORTED_SIG_ALG;
++
+     default:
+-        /* A lot of the errors are not mapped because they are
+-         * primarily internal errors that should never happen. They
+-         * end up here.
+-         */
+         return ATTEST_TOKEN_ERR_GENERAL;
+     }
+ }
+ 
+-#ifdef SYMMETRIC_INITIAL_ATTESTATION
+-/*
+- * Outline of token creation. Much of this occurs inside
+- * t_cose_mac_encode_parameters() and t_cose_mac_encode_tag().
+- *
+- * - Create encoder context
+- * - Open the CBOR array that hold the \c COSE_Mac0
+- * - Write COSE Headers
+- *   - Protected Header
+- *      - Algorithm ID
+- *   - Unprotected Headers
+- *     - Key ID
+- * - Open payload bstr
+- *   - Write payload data, maybe lots of it
+- *   - Get bstr that is the encoded payload
+- * - Compute tag
+- *   - Create a separate encoder context for \c MAC_structure
+- *     - Encode CBOR context identifier
+- *     - Encode protected headers
+- *     - Encode an empty bstr for external_aad
+- *     - Add one more empty bstr that is a "fake payload"
+- *     - Close off \c MAC_structure
+- *   - Call MAC API to compute the tag of all but "fake payload" of
+- *     \c MAC_structure
+- *   - Get payload bstr ptr and length
+- *   - Update the real encoded payload into MAC operation
+- *   - Complete MAC operation
+- * - Write tag into the CBOR output
+- * - Close CBOR array holding the \c COSE_Mac0
+- */
+-
+-/*
+- * Public function. See attest_token.h
+- */
+-enum attest_token_err_t
+-attest_token_encode_start(struct attest_token_encode_ctx *me,
+-                          int32_t key_select,
+-                          int32_t cose_alg_id,
+-                          const struct q_useful_buf *out_buf)
++/* Delegates the ECDSA to the crypto partition. The IAK is a builtin key id, so
++ * the private key never enters this partition. */
++static int attest_wolfcose_sign_cb(void* cbCtx, int32_t alg,
++                                   const uint8_t* tbs, size_t tbsSz,
++                                   uint8_t* sig, size_t sigSz, size_t* sigLen)
+ {
+-    psa_key_id_t key_id = TFM_BUILTIN_KEY_ID_IAK;
+-    struct t_cose_key attest_key;
+-    enum psa_attest_err_t attest_ret;
+-    enum t_cose_err_t cose_ret;
+-    enum attest_token_err_t return_value = ATTEST_TOKEN_ERR_SUCCESS;
+-    struct q_useful_buf_c attest_key_id;
+-
+-    /* Remember some of the configuration values */
+-    me->key_select = key_select;
+-
+-    t_cose_mac_compute_init(&(me->mac_ctx), 0, cose_alg_id);
+-
+-    attest_key.key.handle = (uint64_t)key_id;
+-
+-    attest_ret = attest_get_initial_attestation_key_id(&attest_key_id);
+-    if (attest_ret != PSA_ATTEST_ERR_SUCCESS) {
+-        return ATTEST_TOKEN_ERR_GENERAL;
+-    } else if (!attest_key_id.ptr || !attest_key_id.len) {
+-        /* In case kid value is invalid, set it to NULL */
+-        attest_key_id = NULL_Q_USEFUL_BUF_C;
++    psa_key_id_t key_id = *(psa_key_id_t *)cbCtx;
++    psa_algorithm_t psa_alg;
++    psa_status_t status;
++    size_t out_len = 0;
++
++    switch (alg) {
++    case WOLFCOSE_ALG_ES256:
++        psa_alg = PSA_ALG_ECDSA(PSA_ALG_SHA_256);
++        break;
++    case WOLFCOSE_ALG_ES384:
++        psa_alg = PSA_ALG_ECDSA(PSA_ALG_SHA_384);
++        break;
++    case WOLFCOSE_ALG_ES512:
++        psa_alg = PSA_ALG_ECDSA(PSA_ALG_SHA_512);
++        break;
++    default:
++        return -1;
+     }
+ 
+-    t_cose_mac_set_computing_key(&(me->mac_ctx),
+-                                 attest_key,
+-                                 attest_key_id);
+-
+-    /* Spin up the CBOR encoder */
+-    QCBOREncode_Init(&(me->cbor_enc_ctx), *out_buf);
+-
+-    /* This will cause the cose headers to be encoded and written into
+-     *  out_buf using me->cbor_enc_ctx
+-     */
+-    cose_ret = t_cose_mac_encode_parameters(&(me->mac_ctx),
+-                                            &(me->cbor_enc_ctx));
+-    if (cose_ret != T_COSE_SUCCESS) {
+-        return_value = t_cose_err_to_attest_err(cose_ret);
++    status = psa_sign_hash(key_id, psa_alg, tbs, tbsSz, sig, sigSz, &out_len);
++    if (status != PSA_SUCCESS) {
++        return -1;
+     }
+ 
+-    /* Wrapping the content of the token (payload) into a byte string
+-     * which then can be handed over as input to a hashing function
+-     * as part of signing it.
+-     */
+-    QCBOREncode_BstrWrap(&(me->cbor_enc_ctx));
+-    QCBOREncode_OpenMap(&(me->cbor_enc_ctx));
+-
+-    return return_value;
++    *sigLen = out_len;
++    return 0;
+ }
+ 
+-/*
+- * Public function. See attest_token.h
+- */
+-enum attest_token_err_t
+-attest_token_encode_finish(struct attest_token_encode_ctx *me,
+-                           struct q_useful_buf_c *completed_token)
+-{
+-    enum attest_token_err_t return_value = ATTEST_TOKEN_ERR_SUCCESS;
+-    struct q_useful_buf_c   payload;
+-    /* The completed and tagged encoded COSE_Mac0 */
+-    struct q_useful_buf_c   completed_token_ub;
+-    QCBORError              qcbor_result;
+-    enum t_cose_err_t       cose_return_value;
+-
+-    QCBOREncode_CloseMap(&(me->cbor_enc_ctx));
+-    QCBOREncode_CloseBstrWrap2(&(me->cbor_enc_ctx), false, &payload);
+-
+-    /* -- Finish up the COSE_Mac0. This is where the MAC happens -- */
+-    cose_return_value = t_cose_mac_encode_tag(&(me->mac_ctx),
+-                                              payload,
+-                                              &(me->cbor_enc_ctx));
+-    if (cose_return_value) {
+-        /* Main errors are invoking the tagging */
+-        return_value = t_cose_err_to_attest_err(cose_return_value);
+-        goto Done;
+-    }
+-
+-    /* Finally close off the CBOR formatting and get the pointer and length
+-     * of the resulting COSE_Mac0
+-     */
+-    qcbor_result = QCBOREncode_Finish(&(me->cbor_enc_ctx), &completed_token_ub);
+-    if (qcbor_result == QCBOR_ERR_BUFFER_TOO_SMALL) {
+-           return_value = ATTEST_TOKEN_ERR_TOO_SMALL;
+-    } else if (qcbor_result != QCBOR_SUCCESS) {
+-        /* likely from array not closed, too many closes, ... */
+-        return_value = ATTEST_TOKEN_ERR_CBOR_FORMATTING;
+-    } else {
+-        *completed_token = completed_token_ub;
+-    }
+-
+-Done:
+-    return return_value;
+-}
+-#else /* SYMMETRIC_INITIAL_ATTESTATION */
+-/*
+- * Outline of token creation. Much of this occurs inside
+- * t_cose_sign1_encode_parameters() and t_cose_sign1_encode_signature().
+- *
+- * - Create encoder context
+- * - Open the CBOR array that hold the \c COSE_Sign1
+- * - Write COSE Headers
+- *   - Protected Header
+- *      - Algorithm ID
+- *   - Unprotected Headers
+- *     - Key ID
+- * - Open payload bstr
+- *   - Write payload data, maybe lots of it
+- *   - Get bstr that is the encoded payload
+- * - Compute signature
+- *   - Create a separate encoder context for \c Sig_structure
+- *     - Encode CBOR context identifier
+- *     - Encode protected headers
+- *     - Encode two empty bstr
+- *     - Add one more empty bstr that is a "fake payload"
+- *     - Close off \c Sig_structure
+- *   - Hash all but "fake payload" of \c Sig_structure
+- *   - Get payload bstr ptr and length
+- *   - Continue hash of the real encoded payload
+- *   - Run ECDSA
+- * - Write signature into the CBOR output
+- * - Close CBOR array holding the \c COSE_Sign1
+- */
+-
+-/*
+- * Public function. See attest_token.h
+- */
+ enum attest_token_err_t
+ attest_token_encode_start(struct attest_token_encode_ctx *me,
+                           int32_t key_select,
+@@ -231,99 +83,116 @@ attest_token_encode_start(struct attest_token_encode_ctx *me,
+                           const struct q_useful_buf *out_buf)
+ {
+     enum psa_attest_err_t attest_ret;
+-    enum t_cose_err_t cose_ret;
+-    struct t_cose_key attest_key;
+-    psa_key_id_t private_key = TFM_BUILTIN_KEY_ID_IAK;
+-    struct q_useful_buf_c attest_key_id = NULL_Q_USEFUL_BUF_C;
++    struct q_useful_buf_c attest_key_id = NULLUsefulBufC;
++    struct q_useful_buf claims_buf;
++    int cose_ret;
+ 
+-    /* Remember some of the configuration values */
+     me->key_select = key_select;
++    me->cose_alg_id = cose_alg_id;
++    me->out_buf = *out_buf;
++    me->private_key = TFM_BUILTIN_KEY_ID_IAK;
+ 
+     attest_ret = attest_get_initial_attestation_key_id(&attest_key_id);
+     if (attest_ret != PSA_ATTEST_ERR_SUCCESS) {
+         return ATTEST_TOKEN_ERR_GENERAL;
+     }
++    me->kid = attest_key_id;
+ 
+-    t_cose_sign1_sign_init(&(me->signer_ctx), 0, cose_alg_id);
+-
+-    attest_key.key.handle = (uint64_t)private_key;
+-
+-    t_cose_sign1_set_signing_key(&(me->signer_ctx),
+-                                 attest_key,
+-                                 attest_key_id);
++    cose_ret = wc_CoseKey_Init(&me->cose_key);
++    if (cose_ret != WOLFCOSE_SUCCESS) {
++        return wolfcose_err_to_attest_err(cose_ret);
++    }
+ 
+-    /* Spin up the CBOR encoder */
+-    QCBOREncode_Init(&(me->cbor_enc_ctx), *out_buf);
++    me->cose_key.kty = WOLFCOSE_KTY_EC2;
++    switch (cose_alg_id) {
++    case WOLFCOSE_ALG_ES256:
++        me->cose_key.crv = WOLFCOSE_CRV_P256;
++        break;
++    case WOLFCOSE_ALG_ES384:
++        me->cose_key.crv = WOLFCOSE_CRV_P384;
++        break;
++    case WOLFCOSE_ALG_ES512:
++        me->cose_key.crv = WOLFCOSE_CRV_P521;
++        break;
++    default:
++        return ATTEST_TOKEN_ERR_UNSUPPORTED_SIG_ALG;
++    }
+ 
+-    /* This will cause the cose headers to be encoded and written into
+-     *  out_buf using me->cbor_enc_ctx
+-     */
+-    cose_ret = t_cose_sign1_encode_parameters(&(me->signer_ctx),
+-                                              &(me->cbor_enc_ctx));
+-    if (cose_ret) {
+-        return t_cose_err_to_attest_err(cose_ret);
++    cose_ret = wc_CoseKey_SetExtSigner(&me->cose_key, attest_wolfcose_sign_cb,
++                                        &me->private_key);
++    if (cose_ret != WOLFCOSE_SUCCESS) {
++        return wolfcose_err_to_attest_err(cose_ret);
+     }
+ 
++    /* Claims are encoded on their own, then signed in one shot at finish. The
++     * borrowed-context and add_* callers are unaffected by this. */
++    claims_buf.ptr = attest_claims_buf;
++    claims_buf.len = sizeof(attest_claims_buf);
++    QCBOREncode_Init(&(me->cbor_enc_ctx), claims_buf);
+     QCBOREncode_OpenMap(&(me->cbor_enc_ctx));
+ 
+     return ATTEST_TOKEN_ERR_SUCCESS;
+ }
+ 
+-/*
+- * Public function. See attest_token.h
+- */
+ enum attest_token_err_t
+ attest_token_encode_finish(struct attest_token_encode_ctx *me,
+                            struct q_useful_buf_c *completed_token)
+ {
+-    enum attest_token_err_t return_value = ATTEST_TOKEN_ERR_SUCCESS;
+-    /* The completed and signed encoded cose_sign1 */
+-    struct q_useful_buf_c   completed_token_ub;
+-    QCBORError              qcbor_result;
+-    enum t_cose_err_t       cose_return_value;
++    struct q_useful_buf_c claims;
++    QCBORError qcbor_result;
++    size_t token_len = 0;
++    uint8_t *out_ptr;
++    size_t out_sz;
++    int sizing;
++    int cose_ret;
+ 
+     QCBOREncode_CloseMap(&(me->cbor_enc_ctx));
+ 
+-    /* -- Finish up the COSE_Sign1. This is where the signing happens -- */
+-    cose_return_value = t_cose_sign1_encode_signature(&(me->signer_ctx),
+-                                                      &(me->cbor_enc_ctx));
+-    if (cose_return_value) {
+-        /* Main errors are invoking the hash or signature */
+-        return_value = t_cose_err_to_attest_err(cose_return_value);
+-        goto Done;
++    qcbor_result = QCBOREncode_Finish(&(me->cbor_enc_ctx), &claims);
++    if (qcbor_result == QCBOR_ERR_BUFFER_TOO_SMALL) {
++        return ATTEST_TOKEN_ERR_TOO_SMALL;
++    }
++    else if (qcbor_result != QCBOR_SUCCESS) {
++        return ATTEST_TOKEN_ERR_CBOR_FORMATTING;
+     }
+ 
+-    /* Finally close off the CBOR formatting and get the pointer and length
+-     * of the resulting COSE_Sign1
+-     */
+-    qcbor_result = QCBOREncode_Finish(&(me->cbor_enc_ctx), &completed_token_ub);
+-    if (qcbor_result == QCBOR_ERR_BUFFER_TOO_SMALL) {
+-           return_value = ATTEST_TOKEN_ERR_TOO_SMALL;
+-       } else if (qcbor_result != QCBOR_SUCCESS) {
+-           /* likely from array not closed, too many closes, ... */
+-           return_value = ATTEST_TOKEN_ERR_CBOR_FORMATTING;
+-       } else {
+-           *completed_token = completed_token_ub;
+-       }
+-
+-Done:
+-        return return_value;
++    sizing = (me->out_buf.ptr == NULL);
++    if (sizing) {
++        out_ptr = attest_sizing_buf;
++        out_sz = sizeof(attest_sizing_buf);
++    }
++    else {
++        out_ptr = (uint8_t *)me->out_buf.ptr;
++        out_sz = me->out_buf.len;
++    }
++
++    /* rng is NULL: psa_sign_hash owns its randomness. */
++    cose_ret = wc_CoseSign1_Sign(&me->cose_key, me->cose_alg_id,
++        me->kid.ptr, me->kid.len,
++        claims.ptr, claims.len,
++        NULL, 0,
++        NULL, 0,
++        attest_scratch_buf, sizeof(attest_scratch_buf),
++        out_ptr, out_sz, &token_len,
++        NULL);
++    if (cose_ret != WOLFCOSE_SUCCESS) {
++        return wolfcose_err_to_attest_err(cose_ret);
++    }
++
++    /* In sizing mode only the length is meaningful; the caller passed no
++     * buffer to hand back. */
++    completed_token->ptr = sizing ? NULL : me->out_buf.ptr;
++    completed_token->len = token_len;
++
++    return ATTEST_TOKEN_ERR_SUCCESS;
+ }
+-#endif /* SYMMETRIC_INITIAL_ATTESTATION */
+ 
+-/*
+- * Public function. See attest_token.h
+- */
+ QCBOREncodeContext *
+ attest_token_encode_borrow_cbor_cntxt(struct attest_token_encode_ctx *me)
+ {
+     return &(me->cbor_enc_ctx);
+ }
+ 
+-
+-/*
+- * Public function. See attest_token.h
+- */
+ void attest_token_encode_add_integer(struct attest_token_encode_ctx *me,
+                                      int32_t label,
+                                      int64_t value)
+@@ -331,23 +200,13 @@ void attest_token_encode_add_integer(struct attest_token_encode_ctx *me,
+     QCBOREncode_AddInt64ToMapN(&(me->cbor_enc_ctx), label, value);
+ }
+ 
+-
+-/*
+- * Public function. See attest_token.h
+- */
+ void attest_token_encode_add_bstr(struct attest_token_encode_ctx *me,
+                                   int32_t label,
+                                   const struct q_useful_buf_c *bstr)
+ {
+-    QCBOREncode_AddBytesToMapN(&(me->cbor_enc_ctx),
+-                               label,
+-                               *bstr);
++    QCBOREncode_AddBytesToMapN(&(me->cbor_enc_ctx), label, *bstr);
+ }
+ 
+-
+-/*
+- * Public function. See attest_token.h
+- */
+ void attest_token_encode_add_tstr(struct attest_token_encode_ctx *me,
+                                   int32_t label,
+                                   const struct q_useful_buf_c *tstr)
+@@ -355,13 +214,101 @@ void attest_token_encode_add_tstr(struct attest_token_encode_ctx *me,
+     QCBOREncode_AddTextToMapN(&(me->cbor_enc_ctx), label, *tstr);
+ }
+ 
+-
+-/*
+- * Public function. See attest_token.h
+- */
+ void attest_token_encode_add_cbor(struct attest_token_encode_ctx *me,
+                                   int32_t label,
+                                   const struct q_useful_buf_c *encoded)
+ {
+     QCBOREncode_AddEncodedToMapN(&(me->cbor_enc_ctx), label, *encoded);
+ }
++
++/* Public function. See attest_token.h */
++int attest_encode_cose_key(psa_key_id_t key_id,
++                           struct q_useful_buf buf,
++                           struct q_useful_buf_c *cose_key)
++{
++    uint8_t pub[1u + (2u * 66u)];  /* SEC1 uncompressed: 0x04 || X || Y */
++    psa_key_attributes_t attr = PSA_KEY_ATTRIBUTES_INIT;
++    /* Static: ecc_key/WOLFCOSE_KEY can carry large inline (no-malloc) data;
++     * keep them off the small partition stack. */
++    static WOLFCOSE_KEY key;
++    static ecc_key ecc;
++    size_t pub_len = 0;
++    size_t coord_len = 0;
++    size_t out_len = 0;
++    int32_t crv = 0;
++    int curve_id = 0;
++    int ecc_inited = 0;
++    int ret = 0;
++
++    if (psa_get_key_attributes(key_id, &attr) != PSA_SUCCESS) {
++        ret = -1;
++    }
++
++    if (ret == 0) {
++        switch (psa_get_key_bits(&attr)) {
++        case 256:
++            crv = WOLFCOSE_CRV_P256; coord_len = 32; curve_id = ECC_SECP256R1;
++            break;
++        case 384:
++            crv = WOLFCOSE_CRV_P384; coord_len = 48; curve_id = ECC_SECP384R1;
++            break;
++        case 521:
++            crv = WOLFCOSE_CRV_P521; coord_len = 66; curve_id = ECC_SECP521R1;
++            break;
++        default:
++            ret = -1;
++            break;
++        }
++    }
++
++    if ((ret == 0) &&
++        (psa_export_public_key(key_id, pub, sizeof(pub), &pub_len)
++         != PSA_SUCCESS)) {
++        ret = -1;
++    }
++
++    /* Only the uncompressed form can be split into X and Y. */
++    if ((ret == 0) &&
++        ((pub_len != (1u + (2u * coord_len))) || (pub[0] != 0x04u))) {
++        ret = -1;
++    }
++
++    if (ret == 0) {
++        if (wc_ecc_init(&ecc) != 0) {
++            ret = -1;
++        }
++        else {
++            ecc_inited = 1;
++        }
++    }
++    if ((ret == 0) &&
++        (wc_ecc_import_unsigned(&ecc, &pub[1], &pub[1 + coord_len], NULL,
++                                 curve_id) != 0)) {
++        ret = -1;
++    }
++    if ((ret == 0) && (wc_CoseKey_Init(&key) != WOLFCOSE_SUCCESS)) {
++        ret = -1;
++    }
++    /* kid and alg stay unset: either would be inserted between kty and crv and
++     * change the Instance ID. */
++    if ((ret == 0) &&
++        (wc_CoseKey_SetEcc(&key, crv, &ecc) != WOLFCOSE_SUCCESS)) {
++        ret = -1;
++    }
++    if (ret == 0) {
++        key.hasPrivate = 0;
++        if (wc_CoseKey_Encode(&key, (uint8_t *)buf.ptr, buf.len, &out_len)
++            != WOLFCOSE_SUCCESS) {
++            ret = -1;
++        }
++    }
++    if (ret == 0) {
++        cose_key->ptr = buf.ptr;
++        cose_key->len = out_len;
++    }
++
++    if (ecc_inited != 0) {
++        (void)wc_ecc_free(&ecc);
++    }
++    return ret;
++}
+diff --git a/secure_fw/partitions/initial_attestation/attest_token_encode.h b/secure_fw/partitions/initial_attestation/attest_token_encode.h
+new file mode 100644
+index 000000000..d5302d380
+--- /dev/null
++++ b/secure_fw/partitions/initial_attestation/attest_token_encode.h
+@@ -0,0 +1,28 @@
++#ifndef __ATTEST_TOKEN_ENCODE_H__
++#define __ATTEST_TOKEN_ENCODE_H__
++
++#include "qcbor/qcbor.h"
++#include "psa/crypto.h"
++#include "wolfcose/wolfcose.h"
++#include "attest_token.h"
++
++#ifdef __cplusplus
++extern "C" {
++#endif
++
++struct attest_token_encode_ctx {
++    /* Private data structure */
++    QCBOREncodeContext           cbor_enc_ctx;
++    int32_t                      key_select;
++    WOLFCOSE_KEY                 cose_key;
++    struct q_useful_buf          out_buf;
++    struct q_useful_buf_c        kid;
++    int32_t                      cose_alg_id;
++    psa_key_id_t                 private_key;
++};
++
++#ifdef __cplusplus
++}
++#endif
++
++#endif /* __ATTEST_TOKEN_ENCODE_H__ */
+diff --git a/secure_fw/partitions/initial_attestation/tfm_attest_req_mngr.c b/secure_fw/partitions/initial_attestation/tfm_attest_req_mngr.c
+index 69b471e16..872195b03 100644
+--- a/secure_fw/partitions/initial_attestation/tfm_attest_req_mngr.c
++++ b/secure_fw/partitions/initial_attestation/tfm_attest_req_mngr.c
+@@ -25,7 +25,10 @@ typedef psa_status_t (*attest_func_t)(const psa_msg_t *msg);
+ 
+ int32_t g_attest_caller_id;
+ 
+-#if PSA_FRAMEWORK_HAS_MM_IOVEC == 1
++/* wolfCOSE assembles the COSE_Sign1 in place in the output buffer; a mapped
++ * non-secure outvec faults under that access pattern, so always copy the token
++ * out with psa_write instead of writing a mapped outvec directly. */
++#if 0
+ static psa_status_t psa_attest_get_token(const psa_msg_t *msg)
+ {
+     psa_status_t status;
